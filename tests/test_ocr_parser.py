@@ -142,6 +142,54 @@ def test_parse_skips_empty_answer_marker() -> None:
     assert numbers == ["1", "3"]
 
 
+def test_parse_real_2026_05_22_subquestion_output() -> None:
+    """End-to-end test'te (ornek3.jpeg, prompt v2 sonrası) gerçek Qwen çıkışı.
+
+    Qwen sub-question'ları (2a, 2b, 3a, ...) açtı. Parser bunları ana
+    soru altında grupluyor (a) ... b) ... formatında).
+    """
+    real_output = (
+        "**1)** Pb(NO₃)₂(suda) + KCl(suda) → PbCl₂(k) + 2KNO₃(suda)\n"
+        "Pb(NO₂)(aq) + Cl⁻(aq) → Pb(ClO₂)(suda)\n"
+        "2a)**\n"
+        "Karasal\n"
+        "2b)**\n"
+        "Kimyasal\n"
+        "3a)**\n"
+        "4\n"
+        "3c)**\n"
+        "9\n"
+        "4a)**\n"
+        "Cökelleme\n"
+        "4b)**\n"
+        "Reaksiyonlar tepkimesi!\n"
+        "5a)**\n"
+        "CaCO₃(k) + H⁺(suda) → Ca²⁺(sua) + CO₂(g) + H₂O(l)\n"
+        "5b)**\n"
+        "Mg(k) + Cu(NO₃)_2(suda) -> Mg(NO₃)(suda) + Cu(k)"
+    )
+    result = parse_s3_markdown(real_output)
+    by_id = {a.question_number: a for a in result}
+
+    # Beş ana soru hepsi listede (sub-question'lar gruplanmış)
+    assert set(by_id.keys()) == {"1", "2", "3", "4", "5"}, f"Beklenen 1-5, alınan: {set(by_id.keys())}"
+
+    # Soru 1: ana cevap (kimya denklemi)
+    assert "Pb(NO₃)₂" in by_id["1"].extracted_answer
+
+    # Soru 2: sub-question'lar a) ve b) formatında
+    assert "Karasal" in by_id["2"].extracted_answer
+    assert "Kimyasal" in by_id["2"].extracted_answer
+
+    # Soru 3: eşleştirme sayıları (3a, 3c)
+    assert "4" in by_id["3"].extracted_answer
+    assert "9" in by_id["3"].extracted_answer
+
+    # Soru 5: iki denklem birden
+    assert "CaCO" in by_id["5"].extracted_answer
+    assert "Mg(k)" in by_id["5"].extracted_answer
+
+
 def test_parse_real_2026_05_22_bug_case() -> None:
     """End-to-end test'te (ornek3.jpeg) gözlenen gerçek hata vakası."""
     # Soru 2 halüsinasyon + soru 4-5 karışıklığı — birlikte

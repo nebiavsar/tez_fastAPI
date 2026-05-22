@@ -1,55 +1,47 @@
-"""Qwen2.5-VL'in S3 markdown çıkışını OCRDetectedAnswer listesine parse eder.
+"""Qwen2.5-VL'in OCR çıkışını OCRDetectedAnswer listesine parse eder.
 
-Beklenen format (ocr_service.OCR_PROMPT sonucu):
+Desteklenen format'lar (Qwen tutarsız üretiyor):
+    **1)** ana soru cevabı
+    **3**) yıldız konumu farklı
+    2a)** sub-question (yeni — 2026-05-22 prompt v2 sonrası)
+    3b)** sub-question
+    5)   düz format (fallback)
 
-    **1)** Pb(NO₃)₂(suda)+2KI(suda)->PbI₂(k)+2KNO₃(suda)
+Sub-question'lar ana soru altında a) ... b) ... formatıyla gruplanır:
+    "2a)** Karasal\n2b)** Kimyasal"  →  OCRDetectedAnswer(question_number="2", extracted_answer="a) Karasal\nb) Kimyasal")
 
-    **2)** Suyun buharlaşması: Kondensel
-       Kağıdın yanması: Kimyasal
-
-    **3)** ...
-
-Parse safety-net'leri (2026-05-22 v2 fix):
-  - Block içinde başka soru numarası varsa split eder (4-5 karışıklığı önlemek)
-  - Halüsinasyon satırlarını filtreler ("Yanlış cevap:", "Not:", "Doğru cevap:")
-  - "**N)** (boş)" → atılır (öğrenci cevap yazmamış)
+Safety net'ler (2026-05-22 v2 fix):
+  - Block içinde başka soru numarası varsa split eder
+  - Halüsinasyon satırlarını filtreler ("Yanlış cevap:", "Not:", ...)
+  - "**N)** (boş)" markörünü atar
 
 question_text alanı boş bırakılır — soru metni Spring Boot tarafındaki
-GroupAnswerKey'den gelecek (referans cevap ile birlikte).
+GroupAnswerKey'den gelecek.
 """
 
 from __future__ import annotations
 
 import logging
 import re
+from collections import defaultdict
+from typing import NamedTuple
 
 from app.schemas import OCRDetectedAnswer
 
 logger = logging.getLogger(__name__)
 
-# Qwen'in gerçek dünyada ürettiği başlık varyantları (spike sonuçlarından):
-#   **1)**   ← klasik markdown bold
-#   **3**)   ← model bazen yıldızları sayının etrafına atıyor
-#   **5)     ← bazen kapanış yıldızı eksik
-_HEADER_INNER = r"\*\*\s*(\d+)\s*\*?\*?\s*\)\s*\*?\*?"
-_HEADER_LOOKAHEAD = r"\n\s*\*\*\s*\d+\s*\*?\*?\s*\)\s*\*?\*?"
-
-_ANSWER_BLOCK_RE = re.compile(
-    rf"{_HEADER_INNER}\s*(.+?)(?={_HEADER_LOOKAHEAD}|\Z)",
-    re.DOTALL,
-)
-
-# Fallback: **1)** yoksa "1)" veya "1." başlangıçları
-_PLAIN_NUMBER_RE = re.compile(
-    r"^\s*(\d+)\s*[\.\)]\s*(.+?)(?=\n\s*\d+\s*[\.\)]|\Z)",
-    re.DOTALL | re.MULTILINE,
-)
-
-# Bir blok içindeki sızıntı: satır başında başka bir soru numarası gelirse
-# o satırdan itibaren her şey o sorudan değildir.
-_INLINE_NUMBER_LEAK_RE = re.compile(
-    r"\n\s*(\*\*\s*\d+\s*\*?\*?\s*\)\s*\*?\*?|\d+\s*[\.\)])",
-    re.MULTILINE,
+# Header regex — hem ana hem sub-question yakalar.
+# Örnekler:
+#   **1)**  → main='1', sub=''
+#   **3**)  → main='3', sub=''
+#   2a)**   → main='2', sub='a'
+#   5b)     → main='5', sub='b'
+#   1)      → main='1', sub=''
+#   1.      → main='1', sub=''  (düz fallback, "1." formatı)
+# Anchor: satır başı (MULTILINE) — cümle ortasındaki '(1)' gibi şeyleri yakalamasın.
+_FULL_HEADER_RE = re.compile(
+    r"^[ \t]*\*?\*?\s*(\d+)([a-eçğöşüı]?)\s*\*?\*?\s*[\)\.]\s*\*?\*?",
+    re.IGNORECASE | re.MULTILINE,
 )
 
 # Halüsinasyon paternleri — model'in kendi yorumladığı satırlar
@@ -63,69 +55,97 @@ _HALLUCINATION_PREFIXES = (
     "yorum:",
 )
 
-# "Boş cevap" markörü (yeni prompt'tan)
 _EMPTY_MARKERS = ("(boş)", "(bos)", "[boş]", "[bos]", "(empty)")
 
 
+class _Block(NamedTuple):
+    main: str   # ana soru numarası ("1", "2", ...)
+    sub: str    # sub-letter ("", "a", "b", ...)
+    body: str   # cevap metni
+
+
 def parse_s3_markdown(text: str) -> list[OCRDetectedAnswer]:
-    """Qwen S3 prompt çıkışını OCRDetectedAnswer listesine dönüştür."""
-    matches = list(_ANSWER_BLOCK_RE.finditer(text))
-    if not matches:
-        logger.debug("Markdown **N)** formatı bulunamadı, düz numara formatına geçiliyor")
-        matches = list(_PLAIN_NUMBER_RE.finditer(text))
+    """Qwen çıkışını OCRDetectedAnswer listesine dönüştür.
 
-    answers: list[OCRDetectedAnswer] = []
-    for match in matches:
-        question_number = match.group(1).strip()
-        body = match.group(2).strip()
+    Sub-question'lar ana soru altında gruplanır.
+    """
+    headers = list(_FULL_HEADER_RE.finditer(text))
+    if not headers:
+        logger.warning(
+            "Hiçbir soru başlığı bulunamadı. Ham metin uzunluğu: %d karakter",
+            len(text),
+        )
+        return []
 
-        # Safety net 1: blok içinde başka soru numarası sızıntısı varsa kırp
-        body = _truncate_at_leak(body)
+    # Her header için body'i (sonraki header'a kadar olan metin) çıkar
+    blocks: list[_Block] = []
+    for i, header in enumerate(headers):
+        body_start = header.end()
+        body_end = headers[i + 1].start() if i + 1 < len(headers) else len(text)
+        body = text[body_start:body_end].strip()
 
-        # Safety net 2: halüsinasyon satırlarını ele
         body = _filter_hallucinations(body)
-
-        # Safety net 3: boş cevap markörünü tespit et — atla
         if _is_empty_answer(body):
-            logger.debug("Soru %s boş cevap olarak atlandı", question_number)
+            logger.debug("Soru %s%s boş cevap, atlandı", header.group(1), header.group(2) or "")
+            continue
+        # Tek karakter (örn. eşleştirme sayısı "4") geçerli cevap olabilir → < 1 kontrolü
+        if len(body.strip()) < 1:
             continue
 
-        # Çok kısa veya boş cevapları atla (gürültü)
-        if len(body) < 2:
-            continue
-
-        answers.append(
-            OCRDetectedAnswer(
-                question_number=question_number,
-                question_text="",  # Spring Boot tarafından doldurulacak
-                extracted_answer=_clean_body(body),
+        blocks.append(
+            _Block(
+                main=header.group(1),
+                sub=(header.group(2) or "").lower(),
+                body=_clean_body(body),
             )
         )
 
-    if not answers:
-        logger.warning(
-            "S3 çıkışından soru bloğu çıkarılamadı. Ham metin uzunluğu: %d karakter",
-            len(text),
+    # Ana soru numarasına göre grupla
+    by_main: dict[str, list[_Block]] = defaultdict(list)
+    for block in blocks:
+        by_main[block.main].append(block)
+
+    # Her gruptan OCRDetectedAnswer oluştur
+    answers: list[OCRDetectedAnswer] = []
+    for main_num in sorted(by_main.keys(), key=lambda x: int(x)):
+        parts = by_main[main_num]
+        answer_text = _format_grouped_answer(parts)
+        if not answer_text:
+            continue
+        answers.append(
+            OCRDetectedAnswer(
+                question_number=main_num,
+                question_text="",
+                extracted_answer=answer_text,
+            )
         )
 
     return answers
 
 
-def _truncate_at_leak(text: str) -> str:
-    """Bir blok içindeki sonraki soru numarası başlığında kırp.
+def _format_grouped_answer(parts: list[_Block]) -> str:
+    """Bir ana sorunun parçalarını tek bir cevap metnine birleştir.
 
-    Önceki test: Qwen soru 4'ün bloğuna soru 5'in cevabını yazıyordu. Buradaki
-    regex blok içinde sonraki '**M)**' veya 'M)' başlığı bulursa o noktada
-    metni keser; sonrası ileriki soruya aittir, ana regex onu zaten ayrı match'le yakalar.
+    Tek parça ve sub yoksa → düz body.
+    Birden fazla parça veya sub varsa → "a) ... b) ..." formatlı.
     """
-    leak = _INLINE_NUMBER_LEAK_RE.search(text)
-    if leak is None:
-        return text
-    return text[: leak.start()].rstrip()
+    if not parts:
+        return ""
+
+    if len(parts) == 1 and not parts[0].sub:
+        return parts[0].body
+
+    lines: list[str] = []
+    for part in parts:
+        if part.sub:
+            lines.append(f"{part.sub}) {part.body}")
+        else:
+            lines.append(part.body)
+    return "\n".join(lines)
 
 
 def _filter_hallucinations(text: str) -> str:
-    """Halüsinasyon satırlarını ('Yanlış cevap:', 'Not:' vb.) ele."""
+    """Halüsinasyon satırlarını ele."""
     kept = []
     for line in text.split("\n"):
         stripped_lower = line.strip().lower()
@@ -137,13 +157,11 @@ def _filter_hallucinations(text: str) -> str:
 
 
 def _is_empty_answer(text: str) -> bool:
-    """Öğrenci cevap yazmamış mı (boş markör)?"""
     stripped = text.strip().lower()
     return any(marker in stripped for marker in _EMPTY_MARKERS) and len(stripped) < 30
 
 
 def _clean_body(text: str) -> str:
-    """Cevap metnini temizle — fazla boşluk, leading bullet'ler, vs."""
     lines = [line.strip().lstrip("-*•").strip() for line in text.split("\n")]
     lines = [line for line in lines if line]
     return "\n".join(lines)
