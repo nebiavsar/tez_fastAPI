@@ -21,14 +21,29 @@ from app.schemas import OCRExtractionResult
 logger = logging.getLogger(__name__)
 
 
-# S3 prompt — spike_qwen_vl.py'da en sağlam sonuç veren prompt.
-# Öğrencinin el yazısı cevaplarını soru numarası ile eşleştirip listeler;
-# header/footer/marj notlarını eler.
+# OCR prompt v2 (2026-05-22 fix) — önceki sürümde 3 sorun vardı:
+#   1) Soru 4-5 karışıklığı: model bir bloğa diğer sorunun cevabını dahil ediyordu
+#   2) Halüsinasyon: model "Yanlış cevap:", "Not:" gibi kendi yorumlarını ekliyordu
+#   3) Soru atlama: bazen son soruya hiç ulaşmıyordu (soru 5 kayboldu)
+#
+# Yeni prompt explicit kurallarla bu üçünü hedefliyor. Üç ana ilke:
+#   - Tek-blok-tek-soru disiplini ("başka soru numarasını blok içinde tekrar etme")
+#   - Sadece-öğrenci-yazısı disiplini ("kendi yorumunu/değerlendirmeni ekleme")
+#   - Tam kapsam disiplini ("tüm soruları sırayla işle, atlama")
 OCR_PROMPT = (
-    "Bu görüntüde basılı (matbu) sorulara öğrenci tarafından elle yazılmış cevaplar var. "
-    "Sadece öğrencinin el yazısıyla yazdığı cevapları soru numarasıyla eşleştirip listele. "
-    'Format: "**N)** cevap metni" şeklinde her satır ayrı. '
-    "Öğrenci ismi, okul, marj notları gibi şeyleri yazma."
+    "Bu görüntü bir öğrencinin çözdüğü Türkçe sınav kâğıdıdır. "
+    "Görevin: ÖĞRENCİNİN EL YAZISIYLA yazdığı cevapları çıkarmak.\n\n"
+    "KURALLAR:\n"
+    "1. Her soru için TEK BİR blok yaz. Format kesinlikle şu olmalı:\n"
+    "   **1)** [öğrencinin cevabı]\n"
+    "   **2)** [öğrencinin cevabı]\n"
+    "   ...\n"
+    "2. Bir blok içinde başka soru numarası (3, 4 vb.) ASLA tekrar etme.\n"
+    "3. Sadece öğrencinin yazdıklarını yaz. 'Yanlış cevap:', 'Not:', 'Çözüm:', "
+    "'Doğru cevap:' gibi kendi yorumlarını veya değerlendirmelerini EKLEME.\n"
+    "4. Öğrenci ismi, okul, sınıf, marj notları gibi sınav dışı şeyleri YOK SAY.\n"
+    "5. Tüm soruları sırayla işle, hiçbirini atlama.\n"
+    "6. Eğer bir sorunun cevabını öğrenci yazmamışsa: '**N)** (boş)' yaz."
 )
 
 
