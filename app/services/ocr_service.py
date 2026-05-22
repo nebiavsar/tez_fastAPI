@@ -78,10 +78,19 @@ class OCRService:
             max_new_tokens=768,
         )
 
+        # Debug için ham OCR çıkışını log'a yaz — tip etiketleri var mı görmek için.
+        # Production'da DEBUG seviyesine düşürülebilir; şimdilik teşhis için INFO.
+        logger.info(
+            "OCR ham çıkış (%s):\n--- BAŞ ---\n%s\n--- SON ---",
+            filename,
+            raw_text,
+        )
+
         detected = parse_s3_markdown(raw_text)
         logger.info(
-            "OCR tamamlandı: %s soru bloğu çıkarıldı",
+            "OCR tamamlandı: %s soru bloğu çıkarıldı | tipler: %s",
             len(detected),
+            [f"{a.question_number}={a.question_type.value}" for a in detected],
         )
 
         return OCRExtractionResult(
