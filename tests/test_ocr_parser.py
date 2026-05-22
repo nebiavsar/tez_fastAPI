@@ -10,6 +10,7 @@ alıp parse mantığını lokal makinede doğrular.
 from __future__ import annotations
 
 from app.ml.ocr_parser import parse_s3_markdown
+from app.schemas import QuestionType
 
 
 # Gerçek spike çıkışı (ornek3.jpeg, Qwen2.5-VL-7B, S3 prompt)
@@ -220,3 +221,56 @@ def test_parse_real_2026_05_22_bug_case() -> None:
     # Soru 4: soru 5'in içeriği sızmamış
     assert "Çökelme" in by_id["4"].extracted_answer
     assert "CaCO" not in by_id["4"].extracted_answer
+
+
+# --- Tip tespiti testleri (v3 prompt) ---
+
+
+def test_parse_extracts_open_ended_type() -> None:
+    text = "**1)** [open_ended] Pb(NO3)2 + 2KI -> PbI2 + 2KNO3"
+    result = parse_s3_markdown(text)
+    assert result[0].question_type == QuestionType.OPEN_ENDED
+    # Tip etiketi cevap metninden çıkarılmış olmalı
+    assert "[open_ended]" not in result[0].extracted_answer
+    assert "Pb(NO3)2" in result[0].extracted_answer
+
+
+def test_parse_extracts_fill_blank_type() -> None:
+    text = "**2)** [fill_blank] fiziksel"
+    result = parse_s3_markdown(text)
+    assert result[0].question_type == QuestionType.FILL_BLANK
+    assert result[0].extracted_answer == "fiziksel"
+
+
+def test_parse_extracts_matching_type() -> None:
+    text = "**3)** [matching] a→4, b→2, c→9"
+    result = parse_s3_markdown(text)
+    assert result[0].question_type == QuestionType.MATCHING
+    assert "a→4" in result[0].extracted_answer
+
+
+def test_parse_extracts_multiple_choice_type() -> None:
+    text = "**4)** [multiple_choice] C"
+    result = parse_s3_markdown(text)
+    assert result[0].question_type == QuestionType.MULTIPLE_CHOICE
+    assert result[0].extracted_answer == "C"
+
+
+def test_parse_unknown_type_when_tag_missing() -> None:
+    """Eski format (tip etiketi yok) — geriye dönük uyumluluk."""
+    text = "**1)** klasik cevap"
+    result = parse_s3_markdown(text)
+    # Tek soru, tek block, UNKNOWN tip → group resolver OPEN_ENDED'a düşürür
+    assert result[0].question_type == QuestionType.OPEN_ENDED
+
+
+def test_parse_subquestion_majority_type_wins() -> None:
+    """2a fill_blank + 2b fill_blank → grup tipi FILL_BLANK olmalı."""
+    text = (
+        "**2a)** [fill_blank] fiziksel\n"
+        "**2b)** [fill_blank] kimyasal"
+    )
+    result = parse_s3_markdown(text)
+    assert len(result) == 1
+    assert result[0].question_number == "2"
+    assert result[0].question_type == QuestionType.FILL_BLANK

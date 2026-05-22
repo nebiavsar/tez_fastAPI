@@ -21,29 +21,36 @@ from app.schemas import OCRExtractionResult
 logger = logging.getLogger(__name__)
 
 
-# OCR prompt v2 (2026-05-22 fix) — önceki sürümde 3 sorun vardı:
-#   1) Soru 4-5 karışıklığı: model bir bloğa diğer sorunun cevabını dahil ediyordu
-#   2) Halüsinasyon: model "Yanlış cevap:", "Not:" gibi kendi yorumlarını ekliyordu
-#   3) Soru atlama: bazen son soruya hiç ulaşmıyordu (soru 5 kayboldu)
+# OCR prompt v3 (2026-05-22 evening fix) — sub-question + tip tespiti.
 #
-# Yeni prompt explicit kurallarla bu üçünü hedefliyor. Üç ana ilke:
-#   - Tek-blok-tek-soru disiplini ("başka soru numarasını blok içinde tekrar etme")
-#   - Sadece-öğrenci-yazısı disiplini ("kendi yorumunu/değerlendirmeni ekleme")
-#   - Tam kapsam disiplini ("tüm soruları sırayla işle, atlama")
+# Önceki v2 sürümü el yazısı + halüsinasyon önleme için iyiydi, ama:
+#   - Soru TİPİ (open_ended / fill_blank / matching / multiple_choice) ayrımı yoktu
+#   - SBERT her soruya uygulanıyordu — eşleştirme/çoktan seçmeli için yanlış araç
+#
+# v3 her soru/sub-question başına bir tip etiketi yazdırıyor. Parser bunu yakalıyor.
+# Skorlama dispatcher (app/scoring/) tipe göre doğru scorer'a yönlendiriyor.
 OCR_PROMPT = (
-    "Bu görüntü bir öğrencinin çözdüğü Türkçe sınav kâğıdıdır. "
-    "Görevin: ÖĞRENCİNİN EL YAZISIYLA yazdığı cevapları çıkarmak.\n\n"
+    "Bu görüntü bir Türkçe sınav kâğıdıdır. Sınav kâğıdı öğrenci tarafından doldurulmuş "
+    "VEYA öğretmenin doğru cevap kâğıdı olabilir. Her durumda görevin: "
+    "her sorunun cevabını ve TİPİNİ çıkarmaktır.\n\n"
+    "FORMAT (kesinlikle bu — başka şekilde yazma):\n"
+    "   **1)** [open_ended] cevap metni\n"
+    "   **2a)** [fill_blank] cevap metni\n"
+    "   **3)** [matching] a→4, b→2, c→9\n"
+    "   **4)** [multiple_choice] C\n\n"
+    "TİP TANIMLARI:\n"
+    "- open_ended: açık uçlu klasik soru, cümle veya denklem cevabı\n"
+    "- fill_blank: boşluk doldurma, tek kelime veya kısa ifade (örn. 'fiziksel')\n"
+    "- matching: eşleştirme (a→4 gibi harf-sayı/kelime çiftleri)\n"
+    "- multiple_choice: çoktan seçmeli, tek harf cevap (A/B/C/D/E)\n\n"
     "KURALLAR:\n"
-    "1. Her soru için TEK BİR blok yaz. Format kesinlikle şu olmalı:\n"
-    "   **1)** [öğrencinin cevabı]\n"
-    "   **2)** [öğrencinin cevabı]\n"
-    "   ...\n"
-    "2. Bir blok içinde başka soru numarası (3, 4 vb.) ASLA tekrar etme.\n"
-    "3. Sadece öğrencinin yazdıklarını yaz. 'Yanlış cevap:', 'Not:', 'Çözüm:', "
-    "'Doğru cevap:' gibi kendi yorumlarını veya değerlendirmelerini EKLEME.\n"
+    "1. Her soru için TEK BİR blok yaz. Bir blok içinde başka soru numarası ASLA tekrar etme.\n"
+    "2. Tip etiketini köşeli parantez içinde yaz: [open_ended], [fill_blank] vb.\n"
+    "3. Sadece kâğıttaki cevapları yaz. 'Yanlış cevap:', 'Not:', 'Çözüm:' gibi "
+    "kendi yorumlarını EKLEME.\n"
     "4. Öğrenci ismi, okul, sınıf, marj notları gibi sınav dışı şeyleri YOK SAY.\n"
     "5. Tüm soruları sırayla işle, hiçbirini atlama.\n"
-    "6. Eğer bir sorunun cevabını öğrenci yazmamışsa: '**N)** (boş)' yaz."
+    "6. Cevap yoksa: '**N)** [open_ended] (boş)' yaz."
 )
 
 

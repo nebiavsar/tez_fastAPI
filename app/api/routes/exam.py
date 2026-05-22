@@ -3,9 +3,10 @@
 import logging
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, File, Form, UploadFile
+from fastapi import APIRouter, Depends, File, UploadFile
 
 from app.core.config import Settings, get_settings
+from app.ml.answer_key_cache import AnswerKeyCache, get_answer_key_cache
 from app.ml.qwen_loader import QwenVLLoader, get_qwen_loader
 from app.ml.sbert_loader import SBERTLoader, get_sbert_loader
 from app.schemas import ErrorResponse, ExamProcessingResponse, HealthResponse
@@ -34,11 +35,13 @@ def get_exam_service(
     settings: Annotated[Settings, Depends(get_settings)],
     ocr_service: Annotated[OCRService, Depends(get_ocr_service)],
     nlp_service: Annotated[NLPService, Depends(get_nlp_service)],
+    answer_key_cache: Annotated[AnswerKeyCache, Depends(get_answer_key_cache)],
 ) -> ExamService:
     return ExamService(
         settings=settings,
         ocr_service=ocr_service,
         nlp_service=nlp_service,
+        answer_key_cache=answer_key_cache,
     )
 
 
@@ -54,7 +57,7 @@ async def get_health() -> HealthResponse:
 @router.post(
     "/process-exam",
     response_model=ExamProcessingResponse,
-    summary="Process an uploaded exam image",
+    summary="Process an uploaded exam image with optional answer key image",
     responses={
         400: {"model": ErrorResponse},
         413: {"model": ErrorResponse},
@@ -65,19 +68,31 @@ async def get_health() -> HealthResponse:
 )
 async def process_exam(
     exam_service: Annotated[ExamService, Depends(get_exam_service)],
-    image: UploadFile | None = File(default=None),
-    answer_key: Annotated[
-        str | None,
-        Form(
-            description=(
-                "Opsiyonel: Öğretmenin doğru cevap kâğıdının JSON dizisi. "
-                'Format: \'[{"question_number":"1","expected_answer":"...","max_score":10}, ...]\'. '
-                "Verilmezse NLP skor hesaplanmaz, sadece OCR çıkışı dönderilir."
-            ),
+    paperImage: UploadFile = File(
+        ...,
+        description="Öğrenci tarafından çözülmüş sınav kâğıdı fotoğrafı",
+    ),
+    answerKeyImage: UploadFile | None = File(
+        default=None,
+        description=(
+            "Öğretmenin doğru cevap kâğıdı fotoğrafı. "
+            "Verilmezse NLP skorlama yapılmaz, sadece OCR çıkışı dönderilir. "
+            "Aynı cevap kâğıdı tekrar gönderildiğinde cache'ten okunur."
         ),
-    ] = None,
+    ),
 ) -> ExamProcessingResponse:
-    logger.info("Received /process-exam request (answer_key=%s)", "var" if answer_key else "yok")
-    response = await exam_service.process_exam(image=image, answer_key_json=answer_key)
-    logger.info("Returning /process-exam response with %s questions", len(response.questions))
+    logger.info(
+        "Received /process-exam (paperImage='%s', answerKeyImage='%s')",
+        paperImage.filename,
+        answerKeyImage.filename if answerKeyImage else None,
+    )
+    response = await exam_service.process_exam(
+        paper_image=paperImage,
+        answer_key_image=answerKeyImage,
+    )
+    logger.info(
+        "Returning /process-exam response: %d questions, total score=%d",
+        len(response.questions),
+        response.score,
+    )
     return response

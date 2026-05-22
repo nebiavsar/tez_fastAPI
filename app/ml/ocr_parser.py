@@ -26,9 +26,23 @@ import re
 from collections import defaultdict
 from typing import NamedTuple
 
-from app.schemas import OCRDetectedAnswer
+from app.schemas import OCRDetectedAnswer, QuestionType
 
 logger = logging.getLogger(__name__)
+
+# Tip etiketi regex'i — [open_ended], [fill_blank], [matching], [multiple_choice]
+# Header'dan hemen sonra opsiyonel olarak gelir.
+_TYPE_TAG_RE = re.compile(
+    r"^\s*\[\s*(open_ended|fill_blank|matching|multiple_choice)\s*\]\s*",
+    re.IGNORECASE,
+)
+
+_TYPE_MAP = {
+    "open_ended": QuestionType.OPEN_ENDED,
+    "fill_blank": QuestionType.FILL_BLANK,
+    "matching": QuestionType.MATCHING,
+    "multiple_choice": QuestionType.MULTIPLE_CHOICE,
+}
 
 # Header regex — hem ana hem sub-question yakalar.
 # Örnekler:
@@ -59,9 +73,10 @@ _EMPTY_MARKERS = ("(boş)", "(bos)", "[boş]", "[bos]", "(empty)")
 
 
 class _Block(NamedTuple):
-    main: str   # ana soru numarası ("1", "2", ...)
-    sub: str    # sub-letter ("", "a", "b", ...)
-    body: str   # cevap metni
+    main: str            # ana soru numarası ("1", "2", ...)
+    sub: str             # sub-letter ("", "a", "b", ...)
+    body: str            # cevap metni
+    qtype: QuestionType  # VLM tarafından atanan tip
 
 
 def parse_s3_markdown(text: str) -> list[OCRDetectedAnswer]:
@@ -84,6 +99,9 @@ def parse_s3_markdown(text: str) -> list[OCRDetectedAnswer]:
         body_end = headers[i + 1].start() if i + 1 < len(headers) else len(text)
         body = text[body_start:body_end].strip()
 
+        # Tip etiketini çıkar (varsa); body'den ayır
+        qtype, body = _extract_type_tag(body)
+
         body = _filter_hallucinations(body)
         if _is_empty_answer(body):
             logger.debug("Soru %s%s boş cevap, atlandı", header.group(1), header.group(2) or "")
@@ -97,6 +115,7 @@ def parse_s3_markdown(text: str) -> list[OCRDetectedAnswer]:
                 main=header.group(1),
                 sub=(header.group(2) or "").lower(),
                 body=_clean_body(body),
+                qtype=qtype,
             )
         )
 
@@ -112,15 +131,48 @@ def parse_s3_markdown(text: str) -> list[OCRDetectedAnswer]:
         answer_text = _format_grouped_answer(parts)
         if not answer_text:
             continue
+        # Grup içindeki tipler — sub-question'lar farklı tipte olabilir.
+        # Çoğunluk tipini al; eşitlikse ilkini, hepsi UNKNOWN'sa OPEN_ENDED default.
+        qtype = _resolve_group_type([p.qtype for p in parts])
         answers.append(
             OCRDetectedAnswer(
                 question_number=main_num,
                 question_text="",
                 extracted_answer=answer_text,
+                question_type=qtype,
             )
         )
 
     return answers
+
+
+def _extract_type_tag(body: str) -> tuple[QuestionType, str]:
+    """Body'nin başındaki [tip] etiketini ayır.
+
+    Dönüş: (tip, etiket atılmış body)
+    Etiket yoksa: (UNKNOWN, body)
+    """
+    match = _TYPE_TAG_RE.match(body)
+    if match is None:
+        return QuestionType.UNKNOWN, body
+    tag = match.group(1).lower()
+    qtype = _TYPE_MAP.get(tag, QuestionType.UNKNOWN)
+    return qtype, body[match.end():]
+
+
+def _resolve_group_type(types: list[QuestionType]) -> QuestionType:
+    """Sub-question'lar farklı tip etiketi taşıyabilir — gruba tek tip seç.
+
+    Sıra: çoğunluk → tek tip varsa o → UNKNOWN varsa OPEN_ENDED'a düşür.
+    """
+    non_unknown = [t for t in types if t != QuestionType.UNKNOWN]
+    if not non_unknown:
+        return QuestionType.OPEN_ENDED  # fallback
+    # Çoğunluk
+    counts: dict[QuestionType, int] = defaultdict(int)
+    for t in non_unknown:
+        counts[t] += 1
+    return max(counts.items(), key=lambda kv: kv[1])[0]
 
 
 def _format_grouped_answer(parts: list[_Block]) -> str:

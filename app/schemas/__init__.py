@@ -7,6 +7,7 @@ from app.schemas.exam import (
     OCRDetectedAnswer,
     OCRExtractionResult,
     QuestionItem,
+    QuestionType,
 )
 
 __all__ = [
@@ -17,4 +18,5 @@ __all__ = [
     "OCRDetectedAnswer",
     "OCRExtractionResult",
     "QuestionItem",
+    "QuestionType",
 ]
