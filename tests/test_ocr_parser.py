@@ -256,11 +256,16 @@ def test_parse_extracts_multiple_choice_type() -> None:
     assert result[0].extracted_answer == "C"
 
 
-def test_parse_unknown_type_when_tag_missing() -> None:
-    """Eski format (tip etiketi yok) — geriye dönük uyumluluk."""
-    text = "**1)** klasik cevap"
+def test_parse_unknown_type_falls_back_to_heuristic() -> None:
+    """Tip etiketi yoksa heuristic devreye girer (geriye dönük uyumluluk).
+
+    Uzun cümle + denklem yok ama 50+ karakter → OPEN_ENDED (default).
+    """
+    text = (
+        "**1)** Bu uzun bir klasik soruya cevap. "
+        "Birden çok cümle içerir ve açık uçludur."
+    )
     result = parse_s3_markdown(text)
-    # Tek soru, tek block, UNKNOWN tip → group resolver OPEN_ENDED'a düşürür
     assert result[0].question_type == QuestionType.OPEN_ENDED
 
 
@@ -274,3 +279,76 @@ def test_parse_subquestion_majority_type_wins() -> None:
     assert len(result) == 1
     assert result[0].question_number == "2"
     assert result[0].question_type == QuestionType.FILL_BLANK
+
+
+# --- Heuristic tip tespiti (2026-05-22 fix — VLM tip etiketi yazmıyor) ---
+
+
+def test_heuristic_detects_multiple_choice_single_letter() -> None:
+    text = "**4)**\nC"
+    result = parse_s3_markdown(text)
+    assert result[0].question_type == QuestionType.MULTIPLE_CHOICE
+
+
+def test_heuristic_detects_matching_pairs() -> None:
+    text = (
+        "**3)**\n"
+        "a→4\n"
+        "b→2\n"
+        "c→9"
+    )
+    result = parse_s3_markdown(text)
+    assert result[0].question_type == QuestionType.MATCHING
+
+
+def test_heuristic_detects_fill_blank_label_value_pairs() -> None:
+    text = (
+        "**2)**\n"
+        "Suyun buharlaşması: Fiziksel\n"
+        "Kağıdın yanması: Kimyasal\n"
+        "Tuzun suda çözünmesi: Fiziksel"
+    )
+    result = parse_s3_markdown(text)
+    assert result[0].question_type == QuestionType.FILL_BLANK
+
+
+def test_heuristic_detects_open_ended_for_chemistry_equation() -> None:
+    text = "**1)**\nPb(NO₃)₂(suda) + 2KI(suda) → PbI₂(k) + 2KNO₃(suda)"
+    result = parse_s3_markdown(text)
+    assert result[0].question_type == QuestionType.OPEN_ENDED
+
+
+def test_heuristic_real_2026_05_22_full_output() -> None:
+    """Gerçek Qwen çıkışı (log'dan kopyalandı). Hepsi UNKNOWN ile geliyor,
+    heuristic her birine doğru tipi atamalı."""
+    text = (
+        "**1)**\n"
+        "Pb(NO₃)₂(suda) + 2KI(suda) → PbI₂(k) + ₂KNO₃(suda)\n"
+        "\n"
+        "**2a)**\n"
+        "Suyun buharlaşması: Fazalasıl\n"
+        "Kağıdın yanması: Kromajsal\n"
+        "Tuzun suda çözünmesi: Karışık\n"
+        "Elmanın kararması: Rokaksal\n"
+        "\n"
+        "**3)**\n"
+        "a→4\n"
+        "b→2\n"
+        "c→9\n"
+        "\n"
+        "**4)**\n"
+        "C\n"
+        "\n"
+        "**5)**\n"
+        "Reaktifler | Ürünler |\n"
+        "CaCO₃(k) + HCl(suda) -> CaCl₂(suda), CO₂(g), H₂O(l)\n"
+        "Mg(k) + Cu(NO₃)_2(suda) --> Mg(NO₃)(suda) + Cu(k)"
+    )
+    result = parse_s3_markdown(text)
+    by_id = {a.question_number: a.question_type for a in result}
+
+    assert by_id["1"] == QuestionType.OPEN_ENDED, "kimya denklemi"
+    assert by_id["2"] == QuestionType.FILL_BLANK, "etiket: değer çiftleri"
+    assert by_id["3"] == QuestionType.MATCHING, "a→4 pair'leri"
+    assert by_id["4"] == QuestionType.MULTIPLE_CHOICE, "tek harf C"
+    assert by_id["5"] == QuestionType.OPEN_ENDED, "tablo + denklem"

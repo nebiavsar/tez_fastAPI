@@ -110,6 +110,16 @@ def parse_s3_markdown(text: str) -> list[OCRDetectedAnswer]:
         if len(body.strip()) < 1:
             continue
 
+        # VLM tip etiketi yazmadıysa pattern bazlı heuristic devreye alın
+        if qtype == QuestionType.UNKNOWN:
+            qtype = _detect_type_heuristic(body)
+            logger.debug(
+                "Heuristic tip tespiti: soru %s%s → %s",
+                header.group(1),
+                header.group(2) or "",
+                qtype.value,
+            )
+
         blocks.append(
             _Block(
                 main=header.group(1),
@@ -150,7 +160,8 @@ def _extract_type_tag(body: str) -> tuple[QuestionType, str]:
     """Body'nin başındaki [tip] etiketini ayır.
 
     Dönüş: (tip, etiket atılmış body)
-    Etiket yoksa: (UNKNOWN, body)
+    Etiket yoksa: (UNKNOWN, body) — ama dispatcher'a göndermeden önce
+    _detect_type_heuristic ile fallback yapılır.
     """
     match = _TYPE_TAG_RE.match(body)
     if match is None:
@@ -158,6 +169,65 @@ def _extract_type_tag(body: str) -> tuple[QuestionType, str]:
     tag = match.group(1).lower()
     qtype = _TYPE_MAP.get(tag, QuestionType.UNKNOWN)
     return qtype, body[match.end():]
+
+
+# Heuristic regex'ler — VLM tip etiketini ihmal ettiğinde devreye girer.
+# Sırayla denenir, ilk eşleşen tip kazanır.
+
+# Tek harf cevap: "C", "A.", " B "
+_MC_LETTER_RE = re.compile(r"^\s*[A-E]\s*\.?\s*$", re.IGNORECASE)
+
+# Eşleştirme çifti satırı: "a→4", "b) 2", "c: 9", "d-6"
+_MATCH_PAIR_LINE_RE = re.compile(
+    r"^\s*[a-eçğöşüı]\s*[\-\)\:\→\>]\s*\w+\s*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+# Boşluk doldurma satırı: "Etiket: değer" formatı
+# 3-40 karakter etiket + : + değer
+_FILL_LABEL_LINE_RE = re.compile(
+    r"^[^:\n]{3,40}:\s*\S+",
+    re.MULTILINE,
+)
+
+# Denklem belirtileri (open_ended'in işareti)
+_EQUATION_RE = re.compile(r"[=→↔]|->|→|\+\s*\d|\d+\s*[A-Z]")
+
+
+def _detect_type_heuristic(body: str) -> QuestionType:
+    """Pattern bazlı tip tespiti — VLM etiketi vermediğinde fallback.
+
+    Sıralama önemli:
+        1. Tek harf (A-E) → MULTIPLE_CHOICE
+        2. Eşleştirme çiftleri (≥2) → MATCHING
+        3. "Etiket: değer" çiftleri (≥2) → FILL_BLANK
+        4. Kısa cevap (<50 char) + denklem yok → FILL_BLANK
+        5. Default → OPEN_ENDED
+    """
+    body = body.strip()
+    if not body:
+        return QuestionType.OPEN_ENDED
+
+    # 1. Tek harf cevap
+    if _MC_LETTER_RE.match(body):
+        return QuestionType.MULTIPLE_CHOICE
+
+    # 2. Eşleştirme: 2+ pair line
+    pair_matches = _MATCH_PAIR_LINE_RE.findall(body)
+    if len(pair_matches) >= 2:
+        return QuestionType.MATCHING
+
+    # 3. Boşluk doldurma: 2+ "label: value" satırı
+    fill_matches = _FILL_LABEL_LINE_RE.findall(body)
+    if len(fill_matches) >= 2:
+        return QuestionType.FILL_BLANK
+
+    # 4. Kısa tek cevap (denklem değil) → fill_blank
+    if len(body) < 50 and not _EQUATION_RE.search(body):
+        return QuestionType.FILL_BLANK
+
+    # 5. Default: open_ended
+    return QuestionType.OPEN_ENDED
 
 
 def _resolve_group_type(types: list[QuestionType]) -> QuestionType:
