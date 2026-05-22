@@ -1,0 +1,55 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs / spike outputs
+*.log
+scripts/spike_output_*.txt
+scripts/spike_output_*.json
+
+# --- Büyük model dosyaları ---
+# 449 MB → GitHub 100 MB limit'ini aşar. Colab'da Drive mount veya HuggingFace pull.
+model_ai_noted_with_negatives_positives_v2/
+
+# --- Privacy: gerçek öğrenci sınav fotoğrafları ---
+# ornek*.jpg, ornek*.jpeg, ornek*.png — gerçek sınav kâğıdı görselleri repoya GİRMEMELİ.
+ornek*.jpg
+ornek*.jpeg
+ornek*.png
+
+# Tezde kullanılan ek görseller
+*.JPG
+*.JPEG
+*.PNG
+
+# Test outputs
+.coverage
+htmlcov/
+
+# Environment / secrets
+.env
+.env.local
+*.pem
+*.key

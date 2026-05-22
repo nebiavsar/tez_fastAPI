@@ -1,0 +1,16 @@
+fastapi
+uvicorn[standard]
+python-multipart
+
+# NLP (mevcut, sentence-transformers SBERT için)
+sentence-transformers
+
+# OCR — Qwen2.5-VL-7B-Instruct (ADR-005)
+# NOT: paddlepaddle YOK — sadece transformers/HuggingFace.
+# NOT: torch CUDA build'i ayrıca kurulmalı (lokal kurulum):
+#   pip install torch --index-url https://download.pytorch.org/whl/cu118
+# Colab'da torch zaten kurulu (cu128), bu komuta gerek yok.
+transformers>=5.0.0
+pillow<12
+accelerate
+bitsandbytes  # 4-bit quantization
