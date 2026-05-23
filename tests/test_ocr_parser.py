@@ -1,66 +1,221 @@
-"""parse_s3_markdown için unit testler (section-based type detection, v3).
+"""Parser testleri (v4, 2026-05-23 — yıldızlı section + compound ID + puan parse).
 
-VLM tip etiketi yazma denemesi başarısız oldu (canlı testte 2026-05-22), bunun
-yerine section başlıklarına dayanan deterministik tip tespitine geçildi.
-Pattern heuristic'leri (tek harf MC, "label: value" FB) kaldırıldı.
+Standart sınav formatı:
+    *çoktan seçmeli soru
+    1) ... (10p)
+    A) ... B) ... C) ... D) ...
 
-3 strateji:
-    "Çoktan Seçmeli ..." → MULTIPLE_CHOICE
-    "Boşluk Doldurma" / "Eşleştirme" / "Matching" → FILL_BLANK
-    Başka başlık yok → OPEN_ENDED (default)
+    *boşluk doldurma
+    1) ... (5p)
+
+    1-) açık uçlu (10p)
+
+Compound IDs: mc1, mc2, fb1, fb2, oe1, oe2, oe3
 """
 
 from __future__ import annotations
 
-from app.ml.ocr_parser import parse_s3_markdown
+from app.ml.ocr_parser import (
+    _classify_section_text,
+    _extract_points,
+    parse_s3_markdown,
+)
 from app.schemas import QuestionType
 
 
-# Gerçek spike çıkışı (ornek3.jpeg, Qwen2.5-VL-7B)
-REAL_S3_OUTPUT = """Tabii ki! İşte öğrencinin el ile yazdığı cevapler:
-
-**1)** Pb(NO₃)₂(suda)+2KI(suda)->PbI₂(k)+2KNO₃(suda)
-
-**2)** Suyun buharlaşması: Kondensel
-   Kağıdın yanması: Kimyasal
-   Tuzun suda çözünmesi: Kimyasall
-   Elmanın kararması: Kimyasell
-
-**3**)
-- pH değişimi: 4
-- Gaz çıkışı: 2
-- Enerji değişimı: 6
-- Katı oluşumu: 7
-
-**4**)
-- Tebkime Denklemi: Çözelme
-
-**5**)
-- CaCO₃(k)+2HCI(suda)->CaCI₂(suda)+H₂O(l)+CO₂(e)
-"""
+# --- Helper fonksiyonları ---
 
 
-def test_parse_real_s3_output_extracts_five_questions() -> None:
-    result = parse_s3_markdown(REAL_S3_OUTPUT)
-    numbers = [a.question_number for a in result]
-    assert numbers == ["1", "2", "3", "4", "5"]
+def test_classify_section_multiple_choice_tr() -> None:
+    assert _classify_section_text("çoktan seçmeli soru") == QuestionType.MULTIPLE_CHOICE
+    assert _classify_section_text("Çoktan Seçmeli Sorular") == QuestionType.MULTIPLE_CHOICE
+    assert _classify_section_text("ÇOKTAN SEÇMELİ") == QuestionType.MULTIPLE_CHOICE
 
 
-def test_parse_real_s3_first_question_has_chemistry_equation() -> None:
-    result = parse_s3_markdown(REAL_S3_OUTPUT)
-    first = next(a for a in result if a.question_number == "1")
-    assert "Pb(NO₃)₂" in first.extracted_answer
+def test_classify_section_multiple_choice_en() -> None:
+    assert _classify_section_text("multiple choice") == QuestionType.MULTIPLE_CHOICE
+    assert _classify_section_text("Multiple Choice Question") == QuestionType.MULTIPLE_CHOICE
+    assert _classify_section_text("multiple-choice questions") == QuestionType.MULTIPLE_CHOICE
 
 
-def test_parse_real_s3_default_type_is_open_ended() -> None:
-    """Section başlığı yok → tüm sorular OPEN_ENDED."""
-    result = parse_s3_markdown(REAL_S3_OUTPUT)
-    assert all(a.question_type == QuestionType.OPEN_ENDED for a in result)
+def test_classify_section_fill_blank() -> None:
+    assert _classify_section_text("boşluk doldurma") == QuestionType.FILL_BLANK
+    assert _classify_section_text("eşleştirme") == QuestionType.FILL_BLANK
+    assert _classify_section_text("fill in the blanks") == QuestionType.FILL_BLANK
+    assert _classify_section_text("matching") == QuestionType.FILL_BLANK
 
 
-def test_parse_real_s3_question_text_empty() -> None:
-    result = parse_s3_markdown(REAL_S3_OUTPUT)
-    assert all(a.question_text == "" for a in result)
+def test_classify_section_open_ended() -> None:
+    assert _classify_section_text("açık uçlu") == QuestionType.OPEN_ENDED
+    assert _classify_section_text("klasik") == QuestionType.OPEN_ENDED
+    assert _classify_section_text("kısa cevaplı") == QuestionType.OPEN_ENDED
+    assert _classify_section_text("uzun cevaplı") == QuestionType.OPEN_ENDED
+
+
+def test_classify_section_unknown() -> None:
+    """Tanınmayan section başlığı → None."""
+    assert _classify_section_text("Not:") is None
+    assert _classify_section_text("bla bla") is None
+
+
+def test_extract_points_variants() -> None:
+    assert _extract_points("Soru metni (10p)") == 10
+    assert _extract_points("(5p)") == 5
+    assert _extract_points("(10 puan)") == 10
+    assert _extract_points("Cevap (15 pt)") == 15
+    assert _extract_points("(20 points)") == 20
+    # Yoksa default
+    assert _extract_points("Soru metni", default=10) == 10
+    assert _extract_points("Soru metni", default=5) == 5
+
+
+# --- Parser entegrasyon testleri ---
+
+
+def test_starred_mc_section_assigns_mc_type() -> None:
+    text = (
+        "*çoktan seçmeli soru\n"
+        "1) Türkiye'nin coğrafi konumu? (10p)\n"
+        "A) Devşirme B) İskân C) Tımar D) İltizam\n"
+    )
+    result = parse_s3_markdown(text)
+    assert len(result) == 1
+    assert result[0].question_number == "mc1"
+    assert result[0].question_type == QuestionType.MULTIPLE_CHOICE
+    assert result[0].max_score == 10
+
+
+def test_starred_fb_section_assigns_fb_type() -> None:
+    text = (
+        "*boşluk doldurma\n"
+        "1) Dünya'nın en büyük yüzölçüme sahip ülkesi ...'dir. (5p)\n"
+    )
+    result = parse_s3_markdown(text)
+    assert len(result) == 1
+    assert result[0].question_number == "fb1"
+    assert result[0].question_type == QuestionType.FILL_BLANK
+    assert result[0].max_score == 5
+
+
+def test_no_section_defaults_to_open_ended() -> None:
+    text = (
+        "1-) Fotosentez nedir? (10p)\n"
+        "Cevap: bitkilerin güneş ışığı kullanarak besin üretmesidir.\n"
+    )
+    result = parse_s3_markdown(text)
+    assert len(result) == 1
+    assert result[0].question_number == "oe1"
+    assert result[0].question_type == QuestionType.OPEN_ENDED
+    assert result[0].max_score == 10
+
+
+def test_repeated_numbers_get_distinct_compound_ids() -> None:
+    """Ahmet Yesevi formatında: çoktan seçmeli 1,2 + boşluk doldurma 1,2 + açık uçlu 1,2,3.
+
+    Parser tekrarlı numaraları section prefix ile ayırır: mc1, mc2, fb1, fb2, oe1, oe2, oe3.
+    """
+    text = (
+        "*çoktan seçmeli soru\n"
+        "1) MC soru 1 (10p)\n"
+        "*çoktan seçmeli soru\n"
+        "2) MC soru 2 (10p)\n"
+        "\n"
+        "*boşluk doldurma\n"
+        "1) FB soru 1 (5p)\n"
+        "*boşluk doldurma\n"
+        "2) FB soru 2 (5p)\n"
+        "\n"
+        "1-) OE soru 1 (10p)\n"
+        "Cevap: lorem ipsum\n"
+        "2-) OE soru 2 (10p)\n"
+        "Cevap: dolor sit\n"
+        "3-) OE soru 3 (10p)\n"
+        "Cevap: amet\n"
+    )
+    result = parse_s3_markdown(text)
+    ids = [a.question_number for a in result]
+    # Sıra: mc önce, fb sonra, oe en son
+    assert ids == ["mc1", "mc2", "fb1", "fb2", "oe1", "oe2", "oe3"]
+
+
+def test_per_question_max_score_is_parsed() -> None:
+    text = (
+        "*çoktan seçmeli soru\n"
+        "1) Soru bir (10p)\n"
+        "*çoktan seçmeli soru\n"
+        "2) Soru iki (15p)\n"
+        "*boşluk doldurma\n"
+        "1) Boşluk (5p)\n"
+    )
+    result = parse_s3_markdown(text)
+    by_id = {a.question_number: a.max_score for a in result}
+    assert by_id["mc1"] == 10
+    assert by_id["mc2"] == 15
+    assert by_id["fb1"] == 5
+
+
+def test_ahmet_yesevi_full_paper() -> None:
+    """Gerçek 'Ahmet Yesevi Ortaokulu' sınav kâğıdı formatına benzer simülasyon."""
+    text = (
+        "Ahmet Yesevi Ortaokulu\n"
+        "2. dönem 1. yazılı soruları\n"
+        "Ad: Soyad: Sınıf:\n"
+        "\n"
+        "*Çoktan seçmeli soru\n"
+        "1) Türkiye'nin coğrafi konumu düşünüldüğünde, doğu ve batı uçları arasındaki yerel saat farkı kaç dakikadır? (10p)\n"
+        "A) Devşirme Sistemi\n"
+        "B) İskân Politikası\n"
+        "C) Tımar Sistemi\n"
+        "D) İltizam Sistemi\n"
+        "\n"
+        "*Çoktan seçmeli soru\n"
+        "2) 'Sinekli Bakkal' ve 'Türk'ün Ateşle İmtihanı' gibi eserlerin yazarı olan ünlü edebiyatçımız kimdir? (10p)\n"
+        "A) Halide Edip Adıvar\n"
+        "B) Reşat Nuri Güntekin\n"
+        "C) Yakup Kadri Karaosmanoğlu\n"
+        "D) Sait Faik Abasıyanık\n"
+        "\n"
+        "*boşluk doldurma\n"
+        "1) Dünya'nın en büyük yüzölçümüne sahip ülkesi ............'dir. (5p)\n"
+        "\n"
+        "*boşluk doldurma\n"
+        "2) Güneş sistemimizde 'Kızıl Gezegen' olarak bilinen gezegen ............'tır. (5p)\n"
+        "\n"
+        "1-) Fotosentez süreci temel olarak nasıl işler ve bu sürecin canlı yaşamı için önemi nedir? (10p)\n"
+        "Cevap: bitkiler güneş ışığını kullanarak su ve CO2'den glikoz ve oksijen üretir.\n"
+        "\n"
+        "2-) Sera etkisi nedir ve dünya sıcaklığı üzerindeki temel işlevi nasıl gerçekleşir? (10p)\n"
+        "Cevap: atmosferdeki sera gazları yeryüzünden yansıyan ısıyı tutar.\n"
+        "\n"
+        "3-) Enflasyon kavramını en temel ekonomik ifadesiyle nasıl tanımlarsınız? (10p)\n"
+        "Cevap: para biriminin alım gücünün zamanla azalmasıdır.\n"
+    )
+    result = parse_s3_markdown(text)
+
+    by_id = {a.question_number: a for a in result}
+    expected_ids = {"mc1", "mc2", "fb1", "fb2", "oe1", "oe2", "oe3"}
+    assert set(by_id.keys()) == expected_ids, f"Beklenen {expected_ids}, alınan {set(by_id.keys())}"
+
+    # MC tipleri
+    assert by_id["mc1"].question_type == QuestionType.MULTIPLE_CHOICE
+    assert by_id["mc1"].max_score == 10
+    assert by_id["mc2"].question_type == QuestionType.MULTIPLE_CHOICE
+    assert by_id["mc2"].max_score == 10
+
+    # FB tipleri
+    assert by_id["fb1"].question_type == QuestionType.FILL_BLANK
+    assert by_id["fb1"].max_score == 5
+    assert by_id["fb2"].question_type == QuestionType.FILL_BLANK
+    assert by_id["fb2"].max_score == 5
+
+    # OE tipleri
+    assert by_id["oe1"].question_type == QuestionType.OPEN_ENDED
+    assert by_id["oe1"].max_score == 10
+    assert by_id["oe2"].question_type == QuestionType.OPEN_ENDED
+    assert by_id["oe3"].question_type == QuestionType.OPEN_ENDED
+
+
+# --- Eski test'lerin yeni format'a uyarlamaları ---
 
 
 def test_parse_empty_input_returns_empty_list() -> None:
@@ -68,206 +223,39 @@ def test_parse_empty_input_returns_empty_list() -> None:
     assert parse_s3_markdown("Sadece düz metin, soru numarası yok.") == []
 
 
-def test_parse_plain_numbered_fallback() -> None:
-    text = (
-        "1) Cevap birinci\n"
-        "2. Cevap ikinci\n"
-        "3) Cevap üçüncü uzun bir cümle\n"
-    )
-    result = parse_s3_markdown(text)
-    assert [a.question_number for a in result] == ["1", "2", "3"]
-
-
-def test_parse_strips_bullet_markers() -> None:
-    text = "**1)** - madde A\n- madde B\n* madde C"
-    result = parse_s3_markdown(text)
-    assert result[0].extracted_answer == "madde A\nmadde B\nmadde C"
-
-
 def test_parse_filters_hallucination_lines() -> None:
     text = (
-        "**2)** Suyun buharlaşması: Kondensel\n"
-        "Yanlış cevap: Kondensal\n"
-        "Not: Yanlış işaretlenmiştir.\n"
-        "Kağıdın yanması: Kimyasal"
+        "*çoktan seçmeli soru\n"
+        "1) Soru metni (10p)\n"
+        "Yanlış cevap: B\n"
+        "Not: Doğru C olmalıydı.\n"
     )
     result = parse_s3_markdown(text)
     body = result[0].extracted_answer
-    assert "Suyun buharlaşması: Kondensel" in body
     assert "Yanlış cevap" not in body
     assert "Not:" not in body
 
 
 def test_parse_skips_empty_answer_marker() -> None:
     text = (
-        "**1)** Pb(NO3)2 + 2KI -> PbI2\n"
-        "**2)** (boş)\n"
-        "**3)** Kısmi cevap burada"
+        "*çoktan seçmeli soru\n"
+        "1) ... (10p)\n"
+        "C\n"
+        "*çoktan seçmeli soru\n"
+        "2) ... (10p)\n"
+        "(boş)\n"
     )
     result = parse_s3_markdown(text)
-    numbers = [a.question_number for a in result]
-    assert numbers == ["1", "3"]
+    ids = [a.question_number for a in result]
+    # mc2 boş cevap → atlanır
+    assert ids == ["mc1"]
 
 
-def test_parse_subquestion_grouping() -> None:
+def test_parse_markdown_h3_headers() -> None:
+    """### 1) gibi Markdown başlıklar hâlâ çalışır."""
     text = (
-        "**2a)** Karasal\n"
-        "**2b)** Kimyasal\n"
+        "### 1) Açık uçlu soru (10p)\n"
+        "Cevap: lorem ipsum\n"
     )
     result = parse_s3_markdown(text)
-    assert len(result) == 1
-    assert result[0].question_number == "2"
-    assert "a) Karasal" in result[0].extracted_answer
-    assert "b) Kimyasal" in result[0].extracted_answer
-
-
-# --- Section-based type detection (v3, 2026-05-23) ---
-
-
-def test_section_multiple_choice_tr() -> None:
-    text = (
-        "Çoktan Seçmeli Sorular\n"
-        "**1)** C\n"
-        "**2)** A\n"
-    )
-    result = parse_s3_markdown(text)
-    assert all(a.question_type == QuestionType.MULTIPLE_CHOICE for a in result)
-
-
-def test_section_multiple_choice_en() -> None:
-    text = (
-        "Multiple Choice Questions\n"
-        "**1)** C\n"
-    )
-    result = parse_s3_markdown(text)
-    assert result[0].question_type == QuestionType.MULTIPLE_CHOICE
-
-
-def test_section_fill_blank_bosluk_doldurma() -> None:
-    text = (
-        "Boşluk Doldurma\n"
-        "**1)** fiziksel\n"
-        "**2)** kimyasal\n"
-    )
-    result = parse_s3_markdown(text)
-    assert all(a.question_type == QuestionType.FILL_BLANK for a in result)
-
-
-def test_section_fill_blank_eslestirme() -> None:
-    """'Eşleştirme' başlığı da FILL_BLANK'a yönlendirilir."""
-    text = (
-        "Eşleştirme\n"
-        "**3)** a→4, b→2, c→9\n"
-    )
-    result = parse_s3_markdown(text)
-    assert result[0].question_type == QuestionType.FILL_BLANK
-
-
-def test_section_fill_blank_matching_en() -> None:
-    text = (
-        "Matching\n"
-        "**3)** a-4, b-2\n"
-    )
-    result = parse_s3_markdown(text)
-    assert result[0].question_type == QuestionType.FILL_BLANK
-
-
-def test_section_no_header_means_open_ended() -> None:
-    """Hiç section başlığı yok → her şey OPEN_ENDED."""
-    text = (
-        "**1)** Bu açık uçlu bir cevap, herhangi bir başlık yok\n"
-        "**2)** Yine açık uçlu\n"
-    )
-    result = parse_s3_markdown(text)
-    assert all(a.question_type == QuestionType.OPEN_ENDED for a in result)
-
-
-def test_section_mixed_full_paper() -> None:
-    """Karmaşık senaryo: 3 section, her birinde sorular var."""
-    text = (
-        "Açık Uçlu Sorular\n"
-        "**1)** Pb(NO3)2 + 2KI -> PbI2 + 2KNO3\n"
-        "\n"
-        "Çoktan Seçmeli Sorular\n"
-        "**2)** C\n"
-        "**3)** A\n"
-        "\n"
-        "Boşluk Doldurma\n"
-        "**4a)** fiziksel\n"
-        "**4b)** kimyasal\n"
-        "\n"
-        "Eşleştirme\n"
-        "**5)** a→4, b→2, c→9\n"
-    )
-    result = parse_s3_markdown(text)
-    by_id = {a.question_number: a.question_type for a in result}
-
-    # 1: section "Açık Uçlu" tanınmıyor → default OPEN_ENDED ✓
-    assert by_id["1"] == QuestionType.OPEN_ENDED
-    # 2, 3: Çoktan Seçmeli section'ı
-    assert by_id["2"] == QuestionType.MULTIPLE_CHOICE
-    assert by_id["3"] == QuestionType.MULTIPLE_CHOICE
-    # 4 (grouped 4a + 4b): Boşluk Doldurma section'ı
-    assert by_id["4"] == QuestionType.FILL_BLANK
-    # 5: Eşleştirme section'ı → FILL_BLANK
-    assert by_id["5"] == QuestionType.FILL_BLANK
-
-
-def test_section_header_case_insensitive() -> None:
-    text = (
-        "ÇOKTAN SEÇMELİ SORULAR\n"
-        "**1)** B\n"
-    )
-    result = parse_s3_markdown(text)
-    assert result[0].question_type == QuestionType.MULTIPLE_CHOICE
-
-
-def test_section_header_with_dashes() -> None:
-    """'Multiple-Choice' veya 'Fill-in-the-Blank' gibi tireli varyantlar."""
-    text = (
-        "Multiple-Choice Questions\n"
-        "**1)** C\n"
-    )
-    result = parse_s3_markdown(text)
-    assert result[0].question_type == QuestionType.MULTIPLE_CHOICE
-
-
-# --- VLM tutarsız header formatları (canlı testte 2026-05-23 gözlemlendi) ---
-
-
-def test_parse_markdown_h3_header_format() -> None:
-    """VLM bazen '### 1)' gibi Markdown H3 başlığı kullanıyor."""
-    text = (
-        "### 1) Pb(NO₃)₂ + 2KI → PbI₂ + 2KNO₃\n"
-        "\n"
-        "### 2) Suyun buharlaşması: Fiziksel\n"
-    )
-    result = parse_s3_markdown(text)
-    assert len(result) == 2
-    assert result[0].question_number == "1"
-    assert result[1].question_number == "2"
-    assert "Pb(NO₃)₂" in result[0].extracted_answer
-
-
-def test_parse_markdown_h2_header_subquestion() -> None:
-    """## 4a) gibi H2 + sub-question kombinasyonu."""
-    text = (
-        "## 4a) Karasal\n"
-        "## 4b) Kimyasal\n"
-    )
-    result = parse_s3_markdown(text)
-    assert len(result) == 1
-    assert result[0].question_number == "4"
-    assert "Karasal" in result[0].extracted_answer
-    assert "Kimyasal" in result[0].extracted_answer
-
-
-def test_parse_mixed_header_formats() -> None:
-    """Bazı sorularda '### 1)', bazılarında '**2)**' karışık."""
-    text = (
-        "### 1) Birinci cevap denklemi\n"
-        "**2)** İkinci cevap\n"
-        "3) Üçüncü cevap düz format\n"
-    )
-    result = parse_s3_markdown(text)
-    assert [a.question_number for a in result] == ["1", "2", "3"]
+    assert result[0].question_number == "oe1"

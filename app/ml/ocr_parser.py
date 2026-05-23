@@ -1,32 +1,37 @@
 """Sınav kâğıdı OCR çıkışını OCRDetectedAnswer listesine parse eder.
 
-**Tasarım kararı (2026-05-23 v3):** Soru tipi tespiti **section başlıklarına** dayanır,
-artık pattern heuristic'lerine değil. Öğretmen sınav kâğıdı hazırlarken aşağıdaki
-başlıkları kullanır:
+**Standart sınav formatı (tez spesifikasyonu, 2026-05-23):**
 
-    Çoktan Seçmeli Sorular         → o bölgedeki sorular MULTIPLE_CHOICE
-    Multiple Choice Questions      →                       (aynı)
+    *çoktan seçmeli soru               ← Section başlığı (yıldızlı)
+    1) Soru metni (10p)                ← Numara + soru + puan
+    A) Şık A
+    B) Şık B
+    ...
 
-    Boşluk Doldurma                → o bölgedeki sorular FILL_BLANK
-    Eşleştirme                     →                      (aynı)
-    Fill in the Blanks             →                      (aynı)
-    Matching                       →                      (aynı)
+    *boşluk doldurma                   ← FB section
+    1) Cümle ............'dir. (5p)
 
-    (başka başlık yok)             → OPEN_ENDED (SBERT)
+    1-) Açık uçlu soru? (10p)          ← Section başlığı yok → OPEN_ENDED
+    Cevap: öğrenci yazısı
 
-Soru başlıkları (**1)**, **2a)**, **3)**) bu section'lar arasında dağılır.
-Her soru, kendinden önceki en son section'ın tipini alır.
+**3 strateji:**
+    *çoktan seçmeli / *multiple choice (+ varyantları)  → MULTIPLE_CHOICE
+    *boşluk doldurma / *eşleştirme / *fill in the blank → FILL_BLANK
+    (yıldız yok veya *açık uçlu)                         → OPEN_ENDED
 
-Eski sürümlerde olan ama kaldırılan:
-  - VLM '[open_ended]', '[fill_blank]' etiketi yazması (VLM uyumsuzdu)
-  - Pattern heuristic'leri (tek harf → MC, "label: value" → FB, vs.)
-  - QuestionType.MATCHING (FILL_BLANK ile birleştirildi)
+**Tekrarlı numara handling (mc1 vs fb1 vs oe1):**
+Her section'da numaralandırma 1'den başlayabilir. Parser section prefix
+ekleyerek global unique ID üretir:
+    *çoktan seçmeli + 1) → 'mc1'
+    *boşluk doldurma + 1) → 'fb1'
+    (section yok) + 1) → 'oe1'
 
-Korunanlar:
-  - Sub-question grouping (2a, 2b → "a) ... b) ...")
-  - Halüsinasyon satır filtreleme ("Yanlış cevap:", "Not:", vs.)
-  - Boş cevap markörü atlama ("**N)** (boş)")
-  - Block içinde sızıntı kırpma (4. sorunun bloğuna 5'in içeriği sızarsa)
+Bu sayede iki "Soru 1" karıştırılmaz; cevap kâğıdı ile öğrenci kâğıdı
+deterministik şekilde eşleşir.
+
+**Puan parse:**
+Soru başlığından sonra (10p), (5 puan), (10 pt) gibi formatlar → max_score.
+Yoksa default 10.
 """
 
 from __future__ import annotations
@@ -40,43 +45,78 @@ from app.schemas import OCRDetectedAnswer, QuestionType
 
 logger = logging.getLogger(__name__)
 
-# Soru başlığı varyantları (VLM tutarsız üretiyor):
-#   **1)**       ← markdown bold
-#   **3**)       ← yıldız konumu farklı
-#   2a)**        ← sub-question
-#   5)           ← düz
-#   1.           ← nokta ile
-#   ### 1)       ← Markdown H3 başlık (2026-05-23 canlı testte gözlemlendi)
-#   ## 4a)       ← H2 başlık
+# Soru başlığı varyantları:
+#   1)            düz
+#   **1)**        markdown bold
+#   ### 1)        markdown header
+#   1.            nokta ile
+#   1-)           tire ile (açık uçlu bölümde gözlemlendi)
+#   2a)           sub-question
 _FULL_HEADER_RE = re.compile(
-    r"^[ \t]*#{0,4}\s*\*?\*?\s*(\d+)([a-eçğöşüı]?)\s*\*?\*?\s*[\)\.]\s*\*?\*?",
+    r"^[ \t]*#{0,4}\s*\*?\*?\s*(\d+)([a-eçğöşüı]?)\s*\*?\*?\s*[\-]?\s*[\)\.]\s*\*?\*?",
     re.IGNORECASE | re.MULTILINE,
 )
 
-# Section başlıkları — Türkçe + İngilizce
-_SECTION_PATTERNS: list[tuple[QuestionType, re.Pattern[str]]] = [
+# Yıldızlı section başlığı: *çoktan seçmeli soru, *boşluk doldurma, vs.
+# Yıldızdan sonra ne yazıyorsa al, classify et.
+_STARRED_SECTION_RE = re.compile(
+    r"^\s*\*\s*([^*\n]+?)\s*$",
+    re.MULTILINE,
+)
+
+# Section anahtar kelimeleri — tip eşleştirme
+_SECTION_KEYWORDS: list[tuple[QuestionType, tuple[str, ...]]] = [
     (
         QuestionType.MULTIPLE_CHOICE,
-        re.compile(
-            r"\b(multiple[\s\-]+choice(\s+questions?)?|çoktan\s+seçmeli(\s+sorular?)?)\b",
-            re.IGNORECASE,
+        (
+            "çoktan seçmeli soru",
+            "çoktan seçmeli sorular",
+            "çoktan seçmeli",
+            "multiple choice questions",
+            "multiple choice question",
+            "multiple choice",
+            "multiple-choice",
+            "test soru",
+            "test sorular",
         ),
     ),
     (
         QuestionType.FILL_BLANK,
-        re.compile(
-            r"\b("
-            r"boşluk\s+doldurma|"
-            r"eşleştirme(\s+sorular[ıi])?|"
-            r"fill[\s\-]+in[\s\-]+the[\s\-]+blanks?|"
-            r"matching(\s+questions?)?"
-            r")\b",
-            re.IGNORECASE,
+        (
+            "boşluk doldurma",
+            "bosluk doldurma",
+            "eşleştirme sorular",
+            "eşleştirme",
+            "eslestirme",
+            "fill in the blanks",
+            "fill in the blank",
+            "matching questions",
+            "matching",
+        ),
+    ),
+    (
+        QuestionType.OPEN_ENDED,
+        (
+            "açık uçlu",
+            "acik uclu",
+            "klasik",
+            "kısa cevaplı",
+            "kisa cevapli",
+            "uzun cevaplı",
+            "uzun cevapli",
+            "open ended",
+            "open-ended",
         ),
     ),
 ]
 
-# Halüsinasyon paternleri — model'in kendi yorumladığı satırlar
+# Puan değeri: (10p), (5 p), (10puan), (10 puan), (10pt), (10 points)
+_POINTS_RE = re.compile(
+    r"\(\s*(\d+)\s*(?:p|puan|pt|point|points)\.?\s*\)",
+    re.IGNORECASE,
+)
+
+# Halüsinasyon paternleri
 _HALLUCINATION_PREFIXES = (
     "yanlış cevap",
     "doğru cevap",
@@ -89,46 +129,91 @@ _HALLUCINATION_PREFIXES = (
 
 _EMPTY_MARKERS = ("(boş)", "(bos)", "[boş]", "[bos]", "(empty)")
 
+# Section type → question_number prefix
+_TYPE_PREFIX: dict[QuestionType, str] = {
+    QuestionType.MULTIPLE_CHOICE: "mc",
+    QuestionType.FILL_BLANK: "fb",
+    QuestionType.OPEN_ENDED: "oe",
+}
+
 
 class _Block(NamedTuple):
     main: str            # ana soru numarası ("1", "2", ...)
     sub: str             # sub-letter ("", "a", "b", ...)
     body: str            # cevap metni
     qtype: QuestionType  # section başlığından atanan tip
+    max_score: int       # (Np) formatından parse edilen puan
 
 
-def _find_sections(text: str) -> list[tuple[int, QuestionType]]:
-    """Metindeki tüm section başlıklarını ve pozisyonlarını bul.
+def _classify_section_text(text: str) -> QuestionType | None:
+    """Yıldızlı satırın içeriğine bakıp tipi belirle. Eşleşmezse None."""
+    text_lower = text.lower().strip()
+    for qtype, keywords in _SECTION_KEYWORDS:
+        for kw in keywords:
+            if kw in text_lower:
+                return qtype
+    return None
 
-    Dönüş: pozisyona göre sıralı [(start_index, type), ...]
+
+def _find_starred_sections(text: str) -> list[tuple[int, QuestionType]]:
+    """Yıldızlı section başlıklarını bul.
+
+    Her *X satırı için _classify_section_text ile tip belirle.
+    Tanımsız yıldızlı satırlar atlanır (örn. *Not:).
     """
     sections: list[tuple[int, QuestionType]] = []
-    for qtype, pattern in _SECTION_PATTERNS:
-        for match in pattern.finditer(text):
+    for match in _STARRED_SECTION_RE.finditer(text):
+        section_text = match.group(1)
+        qtype = _classify_section_text(section_text)
+        if qtype is not None:
             sections.append((match.start(), qtype))
+            logger.debug("Section başlığı tespit: '%s' → %s @ pos=%d",
+                         section_text, qtype.value, match.start())
     sections.sort(key=lambda x: x[0])
     return sections
 
 
-def _section_for_position(sections: list[tuple[int, QuestionType]], pos: int) -> QuestionType:
-    """Verilen pozisyondan ÖNCE gelen en son section'ı bul.
+def _section_for_header(
+    sections: list[tuple[int, QuestionType]],
+    headers: list[re.Match[str]],
+    header_idx: int,
+) -> QuestionType:
+    """One-shot section başlığı: her section başlığı SADECE kendinden sonraki
+    ilk soruya tip atar.
 
-    Hiçbir section yoksa veya pozisyon ilk section'dan önceyse → OPEN_ENDED (default).
+    Mantık: Verilen sorunun (header_idx) HEMEN ÖNCESİNDE — önceki sorudan
+    SONRA — yer alan section başlığını bul. Yoksa default OPEN_ENDED.
+
+    Bu sayede 'sticky section' problemi çözülür:
+        *boşluk doldurma
+        1) (5p) ... → FB
+        *boşluk doldurma
+        2) (5p) ... → FB
+        1-) (10p) ... → OE  (section başlığı yok, default)
     """
-    current = QuestionType.OPEN_ENDED
+    current_pos = headers[header_idx].start()
+    prev_header_end = headers[header_idx - 1].end() if header_idx > 0 else 0
+
+    # Önceki soru ile şu an arasında yer alan section başlığı varsa al
     for section_pos, section_type in sections:
-        if section_pos < pos:
-            current = section_type
-        else:
-            break
-    return current
+        if prev_header_end <= section_pos < current_pos:
+            return section_type
+    return QuestionType.OPEN_ENDED
+
+
+def _extract_points(text: str, default: int = 10) -> int:
+    """Metinden (Np), (N puan) gibi puan değerini çıkar. Yoksa default."""
+    match = _POINTS_RE.search(text)
+    if match:
+        return int(match.group(1))
+    return default
 
 
 def parse_s3_markdown(text: str) -> list[OCRDetectedAnswer]:
     """OCR markdown çıkışını OCRDetectedAnswer listesine dönüştür.
 
-    Section başlıklarına göre her soruya tip atanır. Sub-question'lar ana soru
-    altında a) ... b) ... formatıyla gruplanır.
+    Section başlıklarına göre tip atanır. Question ID compound (mc1/fb1/oe1)
+    olarak üretilir. Puan değeri parse edilirse max_score'a atılır.
     """
     headers = list(_FULL_HEADER_RE.finditer(text))
     if not headers:
@@ -138,28 +223,31 @@ def parse_s3_markdown(text: str) -> list[OCRDetectedAnswer]:
         )
         return []
 
-    sections = _find_sections(text)
-    if sections:
-        logger.debug(
-            "Section başlıkları bulundu: %s",
-            [(s[1].value, s[0]) for s in sections],
-        )
+    sections = _find_starred_sections(text)
 
     blocks: list[_Block] = []
     for i, header in enumerate(headers):
         body_start = header.end()
         body_end = headers[i + 1].start() if i + 1 < len(headers) else len(text)
-        body = text[body_start:body_end].strip()
+        body_raw = text[body_start:body_end].strip()
 
-        body = _filter_hallucinations(body)
+        # Tipi belirle: bu sorunun HEMEN ÖNCESİNDEKİ section başlığı (one-shot)
+        qtype = _section_for_header(sections, headers, i)
+
+        # Puan: hem header'ın kendi satırı hem body içinde olabilir
+        # Header'ın bittiği yer ile satır sonu arasındaki kısma da bak
+        header_line_end = text.find("\n", header.end())
+        if header_line_end == -1:
+            header_line_end = len(text)
+        header_remainder = text[header.end():header_line_end]
+        max_score = _extract_points(header_remainder, default=0) or _extract_points(body_raw, default=10)
+
+        body = _filter_hallucinations(body_raw)
         if _is_empty_answer(body):
             logger.debug("Soru %s%s boş cevap, atlandı", header.group(1), header.group(2) or "")
             continue
         if len(body.strip()) < 1:
             continue
-
-        # Bu sorunun pozisyonundan önceki en son section → tip
-        qtype = _section_for_position(sections, header.start())
 
         blocks.append(
             _Block(
@@ -167,28 +255,36 @@ def parse_s3_markdown(text: str) -> list[OCRDetectedAnswer]:
                 sub=(header.group(2) or "").lower(),
                 body=_clean_body(body),
                 qtype=qtype,
+                max_score=max_score,
             )
         )
 
-    # Ana soru numarasına göre grupla (sub-question'lar)
-    by_main: dict[str, list[_Block]] = defaultdict(list)
+    # Compound key (qtype_prefix + main) bazlı grupla
+    # Aynı section'da sub-question'lar birleşir (mc1a + mc1b → mc1 altında a)..b)..)
+    by_key: dict[str, list[_Block]] = defaultdict(list)
     for block in blocks:
-        by_main[block.main].append(block)
+        prefix = _TYPE_PREFIX.get(block.qtype, "oe")
+        key = f"{prefix}{block.main}"
+        by_key[key].append(block)
 
     answers: list[OCRDetectedAnswer] = []
-    for main_num in sorted(by_main.keys(), key=lambda x: int(x)):
-        parts = by_main[main_num]
+    # Sıralama: önce qtype (mc < fb < oe), sonra numara
+    sort_order = {"mc": 0, "fb": 1, "oe": 2}
+    for key in sorted(by_key.keys(), key=lambda k: (sort_order.get(k[:2], 99), int(k[2:]))):
+        parts = by_key[key]
         answer_text = _format_grouped_answer(parts)
         if not answer_text:
             continue
-        # Aynı section içindeki sub-question'lar aynı tipte olur → ilk part'tan al
         qtype = parts[0].qtype
+        # En yüksek max_score (sub-question'lardan)
+        max_score = max(p.max_score for p in parts)
         answers.append(
             OCRDetectedAnswer(
-                question_number=main_num,
+                question_number=key,
                 question_text="",
                 extracted_answer=answer_text,
                 question_type=qtype,
+                max_score=max_score,
             )
         )
 
@@ -196,11 +292,6 @@ def parse_s3_markdown(text: str) -> list[OCRDetectedAnswer]:
 
 
 def _format_grouped_answer(parts: list[_Block]) -> str:
-    """Bir ana sorunun parçalarını tek bir cevap metnine birleştir.
-
-    Tek parça ve sub yoksa → düz body.
-    Birden fazla parça veya sub varsa → "a) ... b) ..." formatlı.
-    """
     if not parts:
         return ""
 
@@ -217,7 +308,6 @@ def _format_grouped_answer(parts: list[_Block]) -> str:
 
 
 def _filter_hallucinations(text: str) -> str:
-    """Halüsinasyon satırlarını ele."""
     kept = []
     for line in text.split("\n"):
         stripped_lower = line.strip().lower()

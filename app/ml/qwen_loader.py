@@ -23,18 +23,25 @@ logger = logging.getLogger(__name__)
 MODEL_PATH = "Qwen/Qwen2.5-VL-7B-Instruct"
 
 # Image token sınırı — VRAM tutumlu kalmak için.
-# 1280 patch = ~1003520 px, T4 16 GB için rahat.
+# Yüksek çözünürlük (2048 patch = ~1.6M px) el yazısı detayları için daha iyi.
+# T4 16 GB rahatlıkla kaldırır.
 MIN_PIXELS = 256 * 28 * 28
-MAX_PIXELS = 1280 * 28 * 28
+MAX_PIXELS = 2048 * 28 * 28
 
-# Generation parametreleri — spike_qwen_vl.py'da degeneration'ı önleyen ayarlar.
+# Generation parametreleri (2026-05-23 deterministik mod):
+#   do_sample=False + temperature=0.0 → tamamen deterministik (aynı görsel = aynı çıkış)
+#   repetition_penalty + no_repeat_ngram → degeneration koruması korunur
+# Bu deterministik mod tezde "reproducibility" iddiasını destekler.
 GENERATION_KWARGS = {
     "repetition_penalty": 1.2,
     "no_repeat_ngram_size": 4,
-    "do_sample": True,
-    "temperature": 0.1,
-    "top_p": 0.9,
+    "do_sample": False,
 }
+
+
+# Yüksek çözünürlüklü görüntü için (el yazısı detayları daha iyi yakalanır).
+# 1280 → 2048 patch. VRAM ~4-6 GB ek, T4 16 GB'da rahat.
+MAX_PIXELS_HIGH_RES = 2048 * 28 * 28
 
 
 class QwenVLLoader:

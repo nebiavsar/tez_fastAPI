@@ -113,18 +113,15 @@ class NLPService:
     def answer_key_from_ocr(ocr_result: OCRExtractionResult, default_max_score: int = 10) -> list[AnswerKeyEntry]:
         """Cevap kâğıdı OCR çıkışını AnswerKeyEntry listesine dönüştür.
 
-        Cevap kâğıdı görseli OCR'dan geçince OCRDetectedAnswer listesi alırız.
-        Bunu NLPService için AnswerKeyEntry formatına çeviriyoruz.
-
-        max_score şu an default — gelecekte cevap kâğıdında puan etiketi
-        ([5p], [10p] gibi) OCR ile çıkarılabilir.
+        max_score parser'ın çıkardığı (Np) değerinden gelir. Parser çıkaramazsa
+        default_max_score kullanılır.
         """
         return [
             AnswerKeyEntry(
                 question_number=item.question_number,
                 expected_answer=item.extracted_answer,
                 question_type=item.question_type if item.question_type != QuestionType.UNKNOWN else QuestionType.OPEN_ENDED,
-                max_score=default_max_score,
+                max_score=item.max_score if item.max_score else default_max_score,
             )
             for item in ocr_result.detected_answers
         ]

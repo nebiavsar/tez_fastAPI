@@ -42,10 +42,20 @@ class ExamProcessingResponse(BaseModel):
 
 
 class OCRDetectedAnswer(BaseModel):
+    """OCR'dan çıkarılan tek soru cevabı.
+
+    question_number compound olabilir: 'mc1', 'fb2', 'oe3' (Ahmet Yesevi
+    formatında her section'ın kendi 1-N numaralandırması var; parser
+    section prefix'i ekleyerek global unique ID üretir).
+
+    max_score: Sınav kâğıdından parse edilen (Np) değeri (yoksa default 10).
+    """
+
     question_number: str
     question_text: str
     extracted_answer: str
     question_type: QuestionType = QuestionType.UNKNOWN
+    max_score: int = 10
 
 
 class OCRExtractionResult(BaseModel):

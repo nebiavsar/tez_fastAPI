@@ -147,33 +147,40 @@ def test_evaluate_respects_max_score_per_question() -> None:
 
 
 def test_answer_key_from_ocr_helper() -> None:
-    """OCRExtractionResult → AnswerKeyEntry listesi dönüşümü."""
+    """OCRExtractionResult → AnswerKeyEntry listesi dönüşümü.
+
+    max_score parser'dan gelir (OCRDetectedAnswer.max_score field'ı).
+    Parser '(Np)' bulduysa o değeri kullanır, yoksa default (10).
+    """
     ocr = OCRExtractionResult(
         raw_text="",
         lines=[],
         detected_answers=[
             OCRDetectedAnswer(
-                question_number="1",
+                question_number="oe1",
                 question_text="",
                 extracted_answer="referans 1",
                 question_type=QuestionType.OPEN_ENDED,
+                max_score=15,  # Parser (15p) okuduysa
             ),
             OCRDetectedAnswer(
-                question_number="2",
+                question_number="fb1",
                 question_text="",
                 extracted_answer="fiziksel",
                 question_type=QuestionType.FILL_BLANK,
+                max_score=5,  # Parser (5p) okuduysa
             ),
         ],
     )
-    keys = NLPService.answer_key_from_ocr(ocr, default_max_score=20)
+    keys = NLPService.answer_key_from_ocr(ocr)
 
     assert len(keys) == 2
-    assert keys[0].question_number == "1"
+    assert keys[0].question_number == "oe1"
     assert keys[0].expected_answer == "referans 1"
     assert keys[0].question_type == QuestionType.OPEN_ENDED
-    assert keys[0].max_score == 20
+    assert keys[0].max_score == 15  # Parser'dan gelir
     assert keys[1].question_type == QuestionType.FILL_BLANK
+    assert keys[1].max_score == 5
 
 
 def test_answer_key_from_ocr_unknown_type_falls_back_to_open_ended() -> None:
