@@ -40,9 +40,16 @@ from app.schemas import OCRDetectedAnswer, QuestionType
 
 logger = logging.getLogger(__name__)
 
-# Soru başlığı: **1)**, **3**), 2a)**, 5)
+# Soru başlığı varyantları (VLM tutarsız üretiyor):
+#   **1)**       ← markdown bold
+#   **3**)       ← yıldız konumu farklı
+#   2a)**        ← sub-question
+#   5)           ← düz
+#   1.           ← nokta ile
+#   ### 1)       ← Markdown H3 başlık (2026-05-23 canlı testte gözlemlendi)
+#   ## 4a)       ← H2 başlık
 _FULL_HEADER_RE = re.compile(
-    r"^[ \t]*\*?\*?\s*(\d+)([a-eçğöşüı]?)\s*\*?\*?\s*[\)\.]\s*\*?\*?",
+    r"^[ \t]*#{0,4}\s*\*?\*?\s*(\d+)([a-eçğöşüı]?)\s*\*?\*?\s*[\)\.]\s*\*?\*?",
     re.IGNORECASE | re.MULTILINE,
 )
 

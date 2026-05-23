@@ -230,3 +230,44 @@ def test_section_header_with_dashes() -> None:
     )
     result = parse_s3_markdown(text)
     assert result[0].question_type == QuestionType.MULTIPLE_CHOICE
+
+
+# --- VLM tutarsız header formatları (canlı testte 2026-05-23 gözlemlendi) ---
+
+
+def test_parse_markdown_h3_header_format() -> None:
+    """VLM bazen '### 1)' gibi Markdown H3 başlığı kullanıyor."""
+    text = (
+        "### 1) Pb(NO₃)₂ + 2KI → PbI₂ + 2KNO₃\n"
+        "\n"
+        "### 2) Suyun buharlaşması: Fiziksel\n"
+    )
+    result = parse_s3_markdown(text)
+    assert len(result) == 2
+    assert result[0].question_number == "1"
+    assert result[1].question_number == "2"
+    assert "Pb(NO₃)₂" in result[0].extracted_answer
+
+
+def test_parse_markdown_h2_header_subquestion() -> None:
+    """## 4a) gibi H2 + sub-question kombinasyonu."""
+    text = (
+        "## 4a) Karasal\n"
+        "## 4b) Kimyasal\n"
+    )
+    result = parse_s3_markdown(text)
+    assert len(result) == 1
+    assert result[0].question_number == "4"
+    assert "Karasal" in result[0].extracted_answer
+    assert "Kimyasal" in result[0].extracted_answer
+
+
+def test_parse_mixed_header_formats() -> None:
+    """Bazı sorularda '### 1)', bazılarında '**2)**' karışık."""
+    text = (
+        "### 1) Birinci cevap denklemi\n"
+        "**2)** İkinci cevap\n"
+        "3) Üçüncü cevap düz format\n"
+    )
+    result = parse_s3_markdown(text)
+    assert [a.question_number for a in result] == ["1", "2", "3"]
