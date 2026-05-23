@@ -21,36 +21,34 @@ from app.schemas import OCRExtractionResult
 logger = logging.getLogger(__name__)
 
 
-# OCR prompt v3 (2026-05-22 evening fix) — sub-question + tip tespiti.
+# OCR prompt v4 (2026-05-23) — tip etiketi atıldı.
 #
-# Önceki v2 sürümü el yazısı + halüsinasyon önleme için iyiydi, ama:
-#   - Soru TİPİ (open_ended / fill_blank / matching / multiple_choice) ayrımı yoktu
-#   - SBERT her soruya uygulanıyordu — eşleştirme/çoktan seçmeli için yanlış araç
+# Eski v3 sürümünde modele "[open_ended], [fill_blank] gibi tip yaz" diyorduk.
+# Canlı testte VLM bu kuralı tutmadı (tip etiketi yazmadı). Yerine artık
+# **section başlıklarına** dayanan deterministik tip tespiti yapıyoruz
+# (app/ml/ocr_parser._SECTION_PATTERNS).
 #
-# v3 her soru/sub-question başına bir tip etiketi yazdırıyor. Parser bunu yakalıyor.
-# Skorlama dispatcher (app/scoring/) tipe göre doğru scorer'a yönlendiriyor.
+# Bu prompt sadece **temiz cevap çıkarımı** ister: her soru için bir blok,
+# halüsinasyon yok, sınav dışı şey yok. Section başlıkları sınav kâğıdında
+# zaten yazılı olduğu için VLM doğal olarak onları da OCR çıkışına ekler.
 OCR_PROMPT = (
     "Bu görüntü bir Türkçe sınav kâğıdıdır. Sınav kâğıdı öğrenci tarafından doldurulmuş "
-    "VEYA öğretmenin doğru cevap kâğıdı olabilir. Her durumda görevin: "
-    "her sorunun cevabını ve TİPİNİ çıkarmaktır.\n\n"
+    "VEYA öğretmenin doğru cevap kâğıdı olabilir.\n\n"
+    "Görevin: her sorunun cevabını çıkarmak.\n\n"
     "FORMAT (kesinlikle bu — başka şekilde yazma):\n"
-    "   **1)** [open_ended] cevap metni\n"
-    "   **2a)** [fill_blank] cevap metni\n"
-    "   **3)** [matching] a→4, b→2, c→9\n"
-    "   **4)** [multiple_choice] C\n\n"
-    "TİP TANIMLARI:\n"
-    "- open_ended: açık uçlu klasik soru, cümle veya denklem cevabı\n"
-    "- fill_blank: boşluk doldurma, tek kelime veya kısa ifade (örn. 'fiziksel')\n"
-    "- matching: eşleştirme (a→4 gibi harf-sayı/kelime çiftleri)\n"
-    "- multiple_choice: çoktan seçmeli, tek harf cevap (A/B/C/D/E)\n\n"
+    "   **1)** cevap metni\n"
+    "   **2a)** cevap metni\n"
+    "   **3)** cevap metni\n\n"
     "KURALLAR:\n"
     "1. Her soru için TEK BİR blok yaz. Bir blok içinde başka soru numarası ASLA tekrar etme.\n"
-    "2. Tip etiketini köşeli parantez içinde yaz: [open_ended], [fill_blank] vb.\n"
-    "3. Sadece kâğıttaki cevapları yaz. 'Yanlış cevap:', 'Not:', 'Çözüm:' gibi "
+    "2. Sadece kâğıttaki cevapları yaz. 'Yanlış cevap:', 'Not:', 'Çözüm:' gibi "
     "kendi yorumlarını EKLEME.\n"
-    "4. Öğrenci ismi, okul, sınıf, marj notları gibi sınav dışı şeyleri YOK SAY.\n"
+    "3. Öğrenci ismi, okul, sınıf, marj notları gibi sınav dışı şeyleri YOK SAY.\n"
+    "4. **Section başlıklarını ('Çoktan Seçmeli Sorular', 'Boşluk Doldurma', "
+    "'Eşleştirme' vb.) çıkışında olduğu gibi koru** — bu başlıklar soru tipi "
+    "tespitinde kullanılır.\n"
     "5. Tüm soruları sırayla işle, hiçbirini atlama.\n"
-    "6. Cevap yoksa: '**N)** [open_ended] (boş)' yaz."
+    "6. Cevap yoksa: '**N)** (boş)' yaz."
 )
 
 

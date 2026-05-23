@@ -1,22 +1,32 @@
-"""Qwen2.5-VL'in OCR çıkışını OCRDetectedAnswer listesine parse eder.
+"""Sınav kâğıdı OCR çıkışını OCRDetectedAnswer listesine parse eder.
 
-Desteklenen format'lar (Qwen tutarsız üretiyor):
-    **1)** ana soru cevabı
-    **3**) yıldız konumu farklı
-    2a)** sub-question (yeni — 2026-05-22 prompt v2 sonrası)
-    3b)** sub-question
-    5)   düz format (fallback)
+**Tasarım kararı (2026-05-23 v3):** Soru tipi tespiti **section başlıklarına** dayanır,
+artık pattern heuristic'lerine değil. Öğretmen sınav kâğıdı hazırlarken aşağıdaki
+başlıkları kullanır:
 
-Sub-question'lar ana soru altında a) ... b) ... formatıyla gruplanır:
-    "2a)** Karasal\n2b)** Kimyasal"  →  OCRDetectedAnswer(question_number="2", extracted_answer="a) Karasal\nb) Kimyasal")
+    Çoktan Seçmeli Sorular         → o bölgedeki sorular MULTIPLE_CHOICE
+    Multiple Choice Questions      →                       (aynı)
 
-Safety net'ler (2026-05-22 v2 fix):
-  - Block içinde başka soru numarası varsa split eder
-  - Halüsinasyon satırlarını filtreler ("Yanlış cevap:", "Not:", ...)
-  - "**N)** (boş)" markörünü atar
+    Boşluk Doldurma                → o bölgedeki sorular FILL_BLANK
+    Eşleştirme                     →                      (aynı)
+    Fill in the Blanks             →                      (aynı)
+    Matching                       →                      (aynı)
 
-question_text alanı boş bırakılır — soru metni Spring Boot tarafındaki
-GroupAnswerKey'den gelecek.
+    (başka başlık yok)             → OPEN_ENDED (SBERT)
+
+Soru başlıkları (**1)**, **2a)**, **3)**) bu section'lar arasında dağılır.
+Her soru, kendinden önceki en son section'ın tipini alır.
+
+Eski sürümlerde olan ama kaldırılan:
+  - VLM '[open_ended]', '[fill_blank]' etiketi yazması (VLM uyumsuzdu)
+  - Pattern heuristic'leri (tek harf → MC, "label: value" → FB, vs.)
+  - QuestionType.MATCHING (FILL_BLANK ile birleştirildi)
+
+Korunanlar:
+  - Sub-question grouping (2a, 2b → "a) ... b) ...")
+  - Halüsinasyon satır filtreleme ("Yanlış cevap:", "Not:", vs.)
+  - Boş cevap markörü atlama ("**N)** (boş)")
+  - Block içinde sızıntı kırpma (4. sorunun bloğuna 5'in içeriği sızarsa)
 """
 
 from __future__ import annotations
@@ -30,33 +40,34 @@ from app.schemas import OCRDetectedAnswer, QuestionType
 
 logger = logging.getLogger(__name__)
 
-# Tip etiketi regex'i — [open_ended], [fill_blank], [matching], [multiple_choice]
-# Header'dan hemen sonra opsiyonel olarak gelir.
-_TYPE_TAG_RE = re.compile(
-    r"^\s*\[\s*(open_ended|fill_blank|matching|multiple_choice)\s*\]\s*",
-    re.IGNORECASE,
-)
-
-_TYPE_MAP = {
-    "open_ended": QuestionType.OPEN_ENDED,
-    "fill_blank": QuestionType.FILL_BLANK,
-    "matching": QuestionType.MATCHING,
-    "multiple_choice": QuestionType.MULTIPLE_CHOICE,
-}
-
-# Header regex — hem ana hem sub-question yakalar.
-# Örnekler:
-#   **1)**  → main='1', sub=''
-#   **3**)  → main='3', sub=''
-#   2a)**   → main='2', sub='a'
-#   5b)     → main='5', sub='b'
-#   1)      → main='1', sub=''
-#   1.      → main='1', sub=''  (düz fallback, "1." formatı)
-# Anchor: satır başı (MULTILINE) — cümle ortasındaki '(1)' gibi şeyleri yakalamasın.
+# Soru başlığı: **1)**, **3**), 2a)**, 5)
 _FULL_HEADER_RE = re.compile(
     r"^[ \t]*\*?\*?\s*(\d+)([a-eçğöşüı]?)\s*\*?\*?\s*[\)\.]\s*\*?\*?",
     re.IGNORECASE | re.MULTILINE,
 )
+
+# Section başlıkları — Türkçe + İngilizce
+_SECTION_PATTERNS: list[tuple[QuestionType, re.Pattern[str]]] = [
+    (
+        QuestionType.MULTIPLE_CHOICE,
+        re.compile(
+            r"\b(multiple[\s\-]+choice(\s+questions?)?|çoktan\s+seçmeli(\s+sorular?)?)\b",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        QuestionType.FILL_BLANK,
+        re.compile(
+            r"\b("
+            r"boşluk\s+doldurma|"
+            r"eşleştirme(\s+sorular[ıi])?|"
+            r"fill[\s\-]+in[\s\-]+the[\s\-]+blanks?|"
+            r"matching(\s+questions?)?"
+            r")\b",
+            re.IGNORECASE,
+        ),
+    ),
+]
 
 # Halüsinasyon paternleri — model'in kendi yorumladığı satırlar
 _HALLUCINATION_PREFIXES = (
@@ -76,13 +87,41 @@ class _Block(NamedTuple):
     main: str            # ana soru numarası ("1", "2", ...)
     sub: str             # sub-letter ("", "a", "b", ...)
     body: str            # cevap metni
-    qtype: QuestionType  # VLM tarafından atanan tip
+    qtype: QuestionType  # section başlığından atanan tip
+
+
+def _find_sections(text: str) -> list[tuple[int, QuestionType]]:
+    """Metindeki tüm section başlıklarını ve pozisyonlarını bul.
+
+    Dönüş: pozisyona göre sıralı [(start_index, type), ...]
+    """
+    sections: list[tuple[int, QuestionType]] = []
+    for qtype, pattern in _SECTION_PATTERNS:
+        for match in pattern.finditer(text):
+            sections.append((match.start(), qtype))
+    sections.sort(key=lambda x: x[0])
+    return sections
+
+
+def _section_for_position(sections: list[tuple[int, QuestionType]], pos: int) -> QuestionType:
+    """Verilen pozisyondan ÖNCE gelen en son section'ı bul.
+
+    Hiçbir section yoksa veya pozisyon ilk section'dan önceyse → OPEN_ENDED (default).
+    """
+    current = QuestionType.OPEN_ENDED
+    for section_pos, section_type in sections:
+        if section_pos < pos:
+            current = section_type
+        else:
+            break
+    return current
 
 
 def parse_s3_markdown(text: str) -> list[OCRDetectedAnswer]:
-    """Qwen çıkışını OCRDetectedAnswer listesine dönüştür.
+    """OCR markdown çıkışını OCRDetectedAnswer listesine dönüştür.
 
-    Sub-question'lar ana soru altında gruplanır.
+    Section başlıklarına göre her soruya tip atanır. Sub-question'lar ana soru
+    altında a) ... b) ... formatıyla gruplanır.
     """
     headers = list(_FULL_HEADER_RE.finditer(text))
     if not headers:
@@ -92,33 +131,28 @@ def parse_s3_markdown(text: str) -> list[OCRDetectedAnswer]:
         )
         return []
 
-    # Her header için body'i (sonraki header'a kadar olan metin) çıkar
+    sections = _find_sections(text)
+    if sections:
+        logger.debug(
+            "Section başlıkları bulundu: %s",
+            [(s[1].value, s[0]) for s in sections],
+        )
+
     blocks: list[_Block] = []
     for i, header in enumerate(headers):
         body_start = header.end()
         body_end = headers[i + 1].start() if i + 1 < len(headers) else len(text)
         body = text[body_start:body_end].strip()
 
-        # Tip etiketini çıkar (varsa); body'den ayır
-        qtype, body = _extract_type_tag(body)
-
         body = _filter_hallucinations(body)
         if _is_empty_answer(body):
             logger.debug("Soru %s%s boş cevap, atlandı", header.group(1), header.group(2) or "")
             continue
-        # Tek karakter (örn. eşleştirme sayısı "4") geçerli cevap olabilir → < 1 kontrolü
         if len(body.strip()) < 1:
             continue
 
-        # VLM tip etiketi yazmadıysa pattern bazlı heuristic devreye alın
-        if qtype == QuestionType.UNKNOWN:
-            qtype = _detect_type_heuristic(body)
-            logger.debug(
-                "Heuristic tip tespiti: soru %s%s → %s",
-                header.group(1),
-                header.group(2) or "",
-                qtype.value,
-            )
+        # Bu sorunun pozisyonundan önceki en son section → tip
+        qtype = _section_for_position(sections, header.start())
 
         blocks.append(
             _Block(
@@ -129,21 +163,19 @@ def parse_s3_markdown(text: str) -> list[OCRDetectedAnswer]:
             )
         )
 
-    # Ana soru numarasına göre grupla
+    # Ana soru numarasına göre grupla (sub-question'lar)
     by_main: dict[str, list[_Block]] = defaultdict(list)
     for block in blocks:
         by_main[block.main].append(block)
 
-    # Her gruptan OCRDetectedAnswer oluştur
     answers: list[OCRDetectedAnswer] = []
     for main_num in sorted(by_main.keys(), key=lambda x: int(x)):
         parts = by_main[main_num]
         answer_text = _format_grouped_answer(parts)
         if not answer_text:
             continue
-        # Grup içindeki tipler — sub-question'lar farklı tipte olabilir.
-        # Çoğunluk tipini al; eşitlikse ilkini, hepsi UNKNOWN'sa OPEN_ENDED default.
-        qtype = _resolve_group_type([p.qtype for p in parts])
+        # Aynı section içindeki sub-question'lar aynı tipte olur → ilk part'tan al
+        qtype = parts[0].qtype
         answers.append(
             OCRDetectedAnswer(
                 question_number=main_num,
@@ -154,95 +186,6 @@ def parse_s3_markdown(text: str) -> list[OCRDetectedAnswer]:
         )
 
     return answers
-
-
-def _extract_type_tag(body: str) -> tuple[QuestionType, str]:
-    """Body'nin başındaki [tip] etiketini ayır.
-
-    Dönüş: (tip, etiket atılmış body)
-    Etiket yoksa: (UNKNOWN, body) — ama dispatcher'a göndermeden önce
-    _detect_type_heuristic ile fallback yapılır.
-    """
-    match = _TYPE_TAG_RE.match(body)
-    if match is None:
-        return QuestionType.UNKNOWN, body
-    tag = match.group(1).lower()
-    qtype = _TYPE_MAP.get(tag, QuestionType.UNKNOWN)
-    return qtype, body[match.end():]
-
-
-# Heuristic regex'ler — VLM tip etiketini ihmal ettiğinde devreye girer.
-# Sırayla denenir, ilk eşleşen tip kazanır.
-
-# Tek harf cevap: "C", "A.", " B "
-_MC_LETTER_RE = re.compile(r"^\s*[A-E]\s*\.?\s*$", re.IGNORECASE)
-
-# Eşleştirme çifti satırı: "a→4", "b) 2", "c: 9", "d-6"
-_MATCH_PAIR_LINE_RE = re.compile(
-    r"^\s*[a-eçğöşüı]\s*[\-\)\:\→\>]\s*\w+\s*$",
-    re.IGNORECASE | re.MULTILINE,
-)
-
-# Boşluk doldurma satırı: "Etiket: değer" formatı
-# 3-40 karakter etiket + : + değer
-_FILL_LABEL_LINE_RE = re.compile(
-    r"^[^:\n]{3,40}:\s*\S+",
-    re.MULTILINE,
-)
-
-# Denklem belirtileri (open_ended'in işareti)
-_EQUATION_RE = re.compile(r"[=→↔]|->|→|\+\s*\d|\d+\s*[A-Z]")
-
-
-def _detect_type_heuristic(body: str) -> QuestionType:
-    """Pattern bazlı tip tespiti — VLM etiketi vermediğinde fallback.
-
-    Sıralama önemli:
-        1. Tek harf (A-E) → MULTIPLE_CHOICE
-        2. Eşleştirme çiftleri (≥2) → MATCHING
-        3. "Etiket: değer" çiftleri (≥2) → FILL_BLANK
-        4. Kısa cevap (<50 char) + denklem yok → FILL_BLANK
-        5. Default → OPEN_ENDED
-    """
-    body = body.strip()
-    if not body:
-        return QuestionType.OPEN_ENDED
-
-    # 1. Tek harf cevap
-    if _MC_LETTER_RE.match(body):
-        return QuestionType.MULTIPLE_CHOICE
-
-    # 2. Eşleştirme: 2+ pair line
-    pair_matches = _MATCH_PAIR_LINE_RE.findall(body)
-    if len(pair_matches) >= 2:
-        return QuestionType.MATCHING
-
-    # 3. Boşluk doldurma: 2+ "label: value" satırı
-    fill_matches = _FILL_LABEL_LINE_RE.findall(body)
-    if len(fill_matches) >= 2:
-        return QuestionType.FILL_BLANK
-
-    # 4. Kısa tek cevap (denklem değil) → fill_blank
-    if len(body) < 50 and not _EQUATION_RE.search(body):
-        return QuestionType.FILL_BLANK
-
-    # 5. Default: open_ended
-    return QuestionType.OPEN_ENDED
-
-
-def _resolve_group_type(types: list[QuestionType]) -> QuestionType:
-    """Sub-question'lar farklı tip etiketi taşıyabilir — gruba tek tip seç.
-
-    Sıra: çoğunluk → tek tip varsa o → UNKNOWN varsa OPEN_ENDED'a düşür.
-    """
-    non_unknown = [t for t in types if t != QuestionType.UNKNOWN]
-    if not non_unknown:
-        return QuestionType.OPEN_ENDED  # fallback
-    # Çoğunluk
-    counts: dict[QuestionType, int] = defaultdict(int)
-    for t in non_unknown:
-        counts[t] += 1
-    return max(counts.items(), key=lambda kv: kv[1])[0]
 
 
 def _format_grouped_answer(parts: list[_Block]) -> str:

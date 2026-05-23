@@ -6,18 +6,23 @@ from pydantic import BaseModel, Field
 
 
 class QuestionType(str, Enum):
-    """Soru tipleri — VLM tarafından otomatik tespit edilir, skorlama metodunu belirler.
+    """Soru tipleri — sınav kâğıdı section başlıklarından deterministik olarak tespit edilir.
 
-    - OPEN_ENDED: cümle-cümle klasik soru, SBERT semantic skorlama
-    - FILL_BLANK: boşluk doldurma, tek kelime / kısa ifade, exact match (Türkçe normalize)
-    - MATCHING: eşleştirme (a→4, b→2), pair-by-pair exact match
+    Tasarım kararı (2026-05-23): VLM otomatik tip tespiti kaldırıldı (güvenilmez sonuçlar
+    veriyordu). Yerine, öğretmen sınav kâğıdı hazırlarken section başlıkları kullanır:
+    - "Çoktan Seçmeli Sorular" → o bölgedeki tüm sorular MULTIPLE_CHOICE
+    - "Boşluk Doldurma" / "Eşleştirme" → FILL_BLANK
+    - Başlık yok → OPEN_ENDED (SBERT semantic)
+
+    Tipler:
+    - OPEN_ENDED: cümle/denklem cevap, SBERT semantic skorlama (DEFAULT)
+    - FILL_BLANK: kısa cevap / eşleştirme, exact match + Türkçe normalize + token kesişimi
     - MULTIPLE_CHOICE: çoktan seçmeli (A/B/C/D), exact letter match
-    - UNKNOWN: VLM tip atayamadı (fallback olarak OPEN_ENDED gibi davranılır)
+    - UNKNOWN: parser tip atayamadı → dispatcher OPEN_ENDED'a düşürür
     """
 
     OPEN_ENDED = "open_ended"
     FILL_BLANK = "fill_blank"
-    MATCHING = "matching"
     MULTIPLE_CHOICE = "multiple_choice"
     UNKNOWN = "unknown"
 
