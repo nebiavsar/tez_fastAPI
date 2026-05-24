@@ -64,18 +64,24 @@ _STARRED_SECTION_RE = re.compile(
     re.MULTILINE,
 )
 
-# Section anahtar kelimeleri — tip eşleştirme
+# Section anahtar kelimeleri — VLM OCR'da yazım varyantlarına toleranslı
+# Strateji: kök kelimelerin tüm gerçek dünya OCR varyantlarını listele.
+# Canlı testlerde gözlemlenen typolar dahil ("seçimli", "boşluktan", "uçlulu" vb.)
 _SECTION_KEYWORDS: list[tuple[QuestionType, tuple[str, ...]]] = [
     (
         QuestionType.MULTIPLE_CHOICE,
         (
-            "çoktan seçmeli soru",
-            "çoktan seçmeli sorular",
+            # Türkçe ana varyantlar
             "çoktan seçmeli",
-            "multiple choice questions",
-            "multiple choice question",
+            "çoktan seçimli",   # OCR varyantı (gözlemlendi 2026-05-23)
+            "çoktan secmeli",
+            "çoktan secimli",
+            "coktan secmeli",
+            "coktan secimli",
+            # İngilizce
             "multiple choice",
             "multiple-choice",
+            # Genel
             "test soru",
             "test sorular",
         ),
@@ -83,29 +89,45 @@ _SECTION_KEYWORDS: list[tuple[QuestionType, tuple[str, ...]]] = [
     (
         QuestionType.FILL_BLANK,
         (
+            # Türkçe ana varyantlar (boşluk + suffix varyasyonu için kök)
             "boşluk doldurma",
+            "boşluktan doldurma",  # OCR varyantı (gözlemlendi 2026-05-23)
             "bosluk doldurma",
-            "eşleştirme sorular",
+            "bosluktan doldurma",
+            "boşluk dol",          # kısaltma toleransı
+            "bosluk dol",
+            # Eşleştirme
             "eşleştirme",
             "eslestirme",
-            "fill in the blanks",
+            "eşleştirmeli",
+            # İngilizce
             "fill in the blank",
-            "matching questions",
+            "fill in the blanks",
+            "fill-in-the-blank",
             "matching",
         ),
     ),
     (
         QuestionType.OPEN_ENDED,
         (
+            # Türkçe ana varyantlar
             "açık uçlu",
+            "açık uç",             # kök
             "acik uclu",
+            "acik uc",
+            "açık uçlulu",         # OCR varyantı (gözlemlendi)
             "klasik",
             "kısa cevaplı",
             "kisa cevapli",
             "uzun cevaplı",
             "uzun cevapli",
+            "kompozisyon",
+            # İngilizce
             "open ended",
             "open-ended",
+            "essay",
+            "short answer",
+            "long answer",
         ),
     ),
 ]

@@ -259,3 +259,69 @@ def test_parse_markdown_h3_headers() -> None:
     )
     result = parse_s3_markdown(text)
     assert result[0].question_number == "oe1"
+
+
+# --- VLM OCR yazım varyantları (canlı testte gözlemlendi 2026-05-23) ---
+
+
+def test_classify_section_handles_ocr_typo_secimli() -> None:
+    """VLM 'çoktan seçmeli' yerine 'çoktan seçimli' yazabilir."""
+    assert _classify_section_text("çoktan seçimli soru") == QuestionType.MULTIPLE_CHOICE
+
+
+def test_classify_section_handles_ocr_typo_bosluktan() -> None:
+    """VLM 'boşluk doldurma' yerine 'boşluktan doldurma' yazabilir."""
+    assert _classify_section_text("boşluktan doldurma") == QuestionType.FILL_BLANK
+
+
+def test_classify_section_handles_ocr_typo_uclulu() -> None:
+    """VLM 'açık uçlu' yerine 'açık uçlulu' yazabilir."""
+    assert _classify_section_text("Açık uçlulu") == QuestionType.OPEN_ENDED
+
+
+def test_parse_real_ahmet_yesevi_ocr_output() -> None:
+    """Gerçek VLM ham çıkışı (Ahmet Yesevi kâğıdı, 2026-05-23 canlı test).
+
+    Yazım hataları içeriyor: 'seçimli', 'boşluktan', 'uçlulu'.
+    Parser yine de doğru tip ataması yapmalı.
+    """
+    text = (
+        "### Çözümler:\n"
+        "\n"
+        "*çoktan seçimli soru\n"
+        "**1)** Türkiye'nin coğrafi konumu... (10 p)\n"
+        "Cevap: 90 Dakika\n"
+        "\n"
+        "*boşluktan doldurma\n"
+        "**1)** Dinova'nın en büyük... ülke?\n"
+        "Cevap: Arjantin\n"
+        "\n"
+        "*çoktan seçimli soru\n"
+        "**2)** Güneş sistemi... 'Kızıl Gezegen'?\n"
+        "Cevaptır: Merkür\n"
+        "\n"
+        "*Açık uçlulu\n"
+        "**1**) Fotosentez süreci... (10 p)\n"
+        "Cevap: İki ileriye\n"
+        "\n"
+        "*Açık uçlulu\n"
+        "**2**) Sera efekti... (10p)\n"
+        "Ceva: Sıcak ileser\n"
+        "\n"
+        "*Açık uçlulu\n"
+        "**3**) Enflasyon ne demek... (10p)?\n"
+        "Cevaptir: Birimiyoforu\n"
+    )
+    result = parse_s3_markdown(text)
+    by_id = {a.question_number: a for a in result}
+
+    # 2 MC + 1 FB + 3 OE bekleniyor
+    expected_ids = {"mc1", "mc2", "fb1", "oe1", "oe2", "oe3"}
+    assert set(by_id.keys()) == expected_ids, f"Beklenen {expected_ids}, alınan {set(by_id.keys())}"
+
+    assert by_id["mc1"].question_type == QuestionType.MULTIPLE_CHOICE
+    assert by_id["mc2"].question_type == QuestionType.MULTIPLE_CHOICE
+    assert by_id["fb1"].question_type == QuestionType.FILL_BLANK
+    assert by_id["oe1"].question_type == QuestionType.OPEN_ENDED
+    assert by_id["oe2"].question_type == QuestionType.OPEN_ENDED
+    assert by_id["oe3"].question_type == QuestionType.OPEN_ENDED
