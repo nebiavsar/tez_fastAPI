@@ -1,583 +1,756 @@
-# OCR Sınav Değerlendirme FastAPI Servisi
+# tez_fastAPI — AI Tabanlı Otomatik Sınav Değerlendirme (ASAG)
 
-Bu proje, OCR tabanlı sınav değerlendirme mimarisinde yer alan **FastAPI işleme servisi**dir. Sistemdeki ana görevi, Spring Boot tarafından gönderilen sınav görselini almak, görseli doğrulamak, OCR ve değerlendirme adımlarını çalıştırmak ve sonucu Spring tarafının beklediği JSON formatında geri döndürmektir.
+> Lisans tez projesi — Türkçe el yazısı sınav kâğıtlarını **otomatik okuyup**, öğretmenin
+> cevap kâğıdı ile karşılaştırarak **soru bazında semantik puan üreten** AI sistemi.
 
-Mevcut sürümde OCR ve NLP/değerlendirme katmanı **placeholder** olarak çalışır. Yani bugün gerçek model entegrasyonu olmadan uçtan uca akış ve API sözleşmesi test edilebilir. Daha sonra gerçek OCR/NLP servisleri eklendiğinde, endpoint sözleşmesini bozmadan yalnızca servis iç mantığı değiştirilebilir.
+Bu repo, sistemin **Python/FastAPI** motorunu içerir: OCR (Qwen2.5-VL-7B Vision-Language
+Model) + NLP semantik karşılaştırma (fine-tuned SBERT) + tip bazlı modüler skorlama.
+Yönetim, kimlik doğrulama ve veritabanı katmanı [tez_springBootAPI](https://github.com/nebiavsar)
+deposunda; Android istemcisi ayrı depoda.
 
-## 1. Projenin Amacı
+---
 
-Bu servis doğrudan son kullanıcıya hizmet veren ana backend değildir. Ana backend rolü Spring Boot tarafındadır. FastAPI burada daha çok:
+## İçindekiler
 
-- sınav görselini işleyen uzman servis,
-- OCR ve değerlendirme orkestrasyon katmanı,
-- Spring için sade ve sabit bir JSON sağlayıcısı
+1. [Sorun ve çözüm](#1-sorun-ve-çözüm)
+2. [Sistem mimarisi](#2-sistem-mimarisi)
+3. [Uçtan uca işlem akışı](#3-uçtan-uca-işlem-akışı)
+4. [OCR katmanı (FastAPI)](#4-ocr-katmanı-fastapi)
+5. [NLP katmanı — tip bazlı skorlama](#5-nlp-katmanı--tip-bazlı-skorlama)
+6. [Standart sınav kâğıdı formatı](#6-standart-sınav-kâğıdı-formatı)
+7. [API sözleşmesi](#7-api-sözleşmesi)
+8. [Kullanılan teknolojiler](#8-kullanılan-teknolojiler)
+9. [Proje yapısı](#9-proje-yapısı)
+10. [Lokal geliştirme](#10-lokal-geliştirme)
+11. [Production / demo deployment (Colab + ngrok)](#11-production--demo-deployment-colab--ngrok)
+12. [Spring Boot entegrasyonu](#12-spring-boot-entegrasyonu)
+13. [Test sonuçları](#13-test-sonuçları)
+14. [Sınırlamalar ve gelecek çalışmalar](#14-sınırlamalar-ve-gelecek-çalışmalar)
 
-olarak konumlanır.
+---
 
-Bu sayede sistemde sorumluluklar ayrılır:
+## 1. Sorun ve çözüm
 
-- **Frontend / mobil uygulama**: kullanıcıdan görsel alır ve işlemi başlatır
-- **Spring Boot**: kimlik doğrulama, iş kuralları, veritabanı, kullanıcı/sınav yönetimi, sonuç saklama
-- **FastAPI**: dosya doğrulama, OCR çalıştırma, cevapları çıkarma, puanlama sonucunu üretme
+### Sorun
 
-## 2. Yüksek Seviyeli Mimari
+Öğretmenler her hafta onlarca sınav kâğıdı okuyup puanlıyor. Açık uçlu sorularda:
+- Manuel okuma zaman alıcı (her sınav ~3-5 dk)
+- Öğretmenler arası **subjektivite** (aynı cevap farklı puan alabiliyor)
+- El yazısı çözmek yorucu
 
-Önerilen akış aşağıdaki gibidir:
+### Çözümümüz
 
-```text
-Frontend / Mobile
-        |
-        v
-Spring Boot Backend
-        |
-        v
-FastAPI OCR Service
-   |            |
-   v            v
- OCR  -->  NLP / Evaluation
-        |
-        v
-Spring Boot
-        |
-        v
-Frontend / Mobile
+Üç katmanlı bir AI pipeline:
+
+1. **OCR** — Görüntüden el yazısı + basılı metin çıkar (Qwen2.5-VL-7B VLM)
+2. **Tip tespiti** — Her soruyu *çoktan seçmeli*, *boşluk doldurma* veya *açık uçlu* olarak sınıflandır
+3. **Tip bazlı skorlama** — Açık uçlular için **SBERT semantik benzerlik**, diğer tipler için **exact / pattern match**
+
+**Tezin merkezi katkısı:** SBERT semantik karşılaştırma sayesinde, klasik OCR'ın
+"%100 doğru karakter okumadığı" durumlarda bile **anlamsal benzerlik** yakalanabilir.
+Örneğin OCR "Pb(NO₃)₂" yerine "Pb(NO₃)2" yazsa SBERT bunu **doğru cevap** olarak
+yakalar — klasik string matching ile sıfır puan alacak vakalarda **kısmi/tam puan** üretir.
+
+---
+
+## 2. Sistem mimarisi
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                              KULLANICI KATMANI                              │
+│   ┌──────────────────────────────────────────────────────────────────┐      │
+│   │  Android (Kotlin)                                                │      │
+│   │  - Kamera ile sınav kâğıdı fotoğrafı çek                         │      │
+│   │  - Sınıf/öğrenci/sınav yönetimi UI                               │      │
+│   └──────────────────────────────────────────────────────────────────┘      │
+│                                  │                                          │
+│                                  │ HTTP (JWT auth)                          │
+└──────────────────────────────────┼──────────────────────────────────────────┘
+                                   ↓
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                          ORKESTRASYON KATMANI                               │
+│   ┌──────────────────────────────────────────────────────────────────┐      │
+│   │  Spring Boot 3 (Java)        tez_springBootAPI                   │      │
+│   │  - Kullanıcı/sınıf/öğrenci/sınav CRUD (PostgreSQL/MySQL)         │      │
+│   │  - JWT auth, dosya yönetimi, image servisi                       │      │
+│   │  - WebClient ile FastAPI'ye proxy (multipart)                    │      │
+│   └──────────────────────────────────────────────────────────────────┘      │
+│                                  │                                          │
+│                                  │ POST /process-exam                       │
+│                                  │   paperImage + answerKeyImage            │
+└──────────────────────────────────┼──────────────────────────────────────────┘
+                                   ↓
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                            AI KATMANI (BU REPO)                             │
+│   ┌──────────────────────────────────────────────────────────────────┐      │
+│   │  FastAPI (Python)            tez_fastAPI                         │      │
+│   │  ┌──────────────────────────────────────────────────────────┐    │      │
+│   │  │  ExamService  (orkestrasyon + cache)                     │    │      │
+│   │  │  ┌─────────────────┐         ┌─────────────────────┐    │    │      │
+│   │  │  │ OCRService      │ ───→    │ NLPService          │    │    │      │
+│   │  │  │ Qwen2.5-VL-7B   │         │ Strategy Dispatcher │    │    │      │
+│   │  │  │ (4-bit quant)   │         │ ┌──────┬──────┬───┐ │    │    │      │
+│   │  │  └─────────────────┘         │ │ MC   │ FB   │OE │ │    │    │      │
+│   │  │                              │ └──────┴──────┴───┘ │    │    │      │
+│   │  │                              │     ↓        ↓  ↓   │    │    │      │
+│   │  │                              │  Exact   Token SBERT│    │    │      │
+│   │  │                              └─────────────────────┘    │    │      │
+│   │  └──────────────────────────────────────────────────────────┘    │      │
+│   └──────────────────────────────────────────────────────────────────┘      │
+└─────────────────────────────────────────────────────────────────────────────┘
 ```
 
-Kısa özet:
+### Backend ayrımının gerekçesi
 
-1. Kullanıcı sınav kağıdının fotoğrafını veya görselini frontend üzerinden yükler.
-2. Frontend isteği Spring Boot'a gönderir.
-3. Spring Boot gerekli iş kurallarını uygular ve görseli FastAPI'ye iletir.
-4. FastAPI dosyayı doğrular.
-5. FastAPI OCR katmanını çağırır.
-6. OCR çıktısı değerlendirme/NLP katmanına aktarılır.
-7. Sonuç Spring'in beklediği JSON'a dönüştürülür.
-8. Spring isterse sonucu veritabanına kaydeder ve frontend'e kendi response formatıyla döner.
+| Katman | Sorumluluk | Neden ayrı? |
+|---|---|---|
+| **Spring Boot** | CRUD, auth, persist, dosya yönetimi | Java'nın olgun enterprise yığını (Spring Security, JPA, validation) |
+| **FastAPI** | OCR + NLP inference | Python'un ML ekosistemi (PyTorch, transformers, sentence-transformers) |
 
-## 3. FastAPI Servisinin Sorumlulukları
+Java tarafında PyTorch ekosistemini çoğaltmak çok zahmetli; Python'da Spring kalitesinde
+auth/persist altyapısı kurmak da öyle. Mikroservis ayrımı her iki dünyanın güçlü
+yanlarını birleştirir.
 
-Bu servis şunları yapar:
+---
 
-- `multipart/form-data` ile gelen sınav görselini alır
-- dosyanın boş olup olmadığını, tipini ve boyutunu kontrol eder
-- OCR servisini çağırır
-- OCR sonucunu değerlendirme servisine iletir
-- sonucu sabit bir response modeliyle döndürür
-- hataları anlamlı JSON formatında döner
+## 3. Uçtan uca işlem akışı
 
-Bu servis şunları yapmaz:
+### Tek bir sınav değerlendirme isteği
 
-- kullanıcı girişi / yetkilendirme
-- veritabanı işlemleri
-- sınav oluşturma, öğrenci yönetimi, öğretmen paneli
-- frontend sayfaları
-- Spring tarafındaki domain/business logic
+```
+1. Öğretmen Android app'te:
+   "Yeni sınav ekle" → öğrenci kâğıdı fotoğrafı çek
 
-## 4. Mevcut İş Mantığı
+2. Android → Spring Boot:
+   PUT /api/classes/{groupId}
+     multipart: postExamDTO (JSON) + examPhotos[] (bytes)
+   JWT auth header
 
-Şu anki sürüm geliştirme ve entegrasyon odaklıdır.
+3. Spring Boot:
+   - Validate (sınıf var mı, öğretmenin mi)
+   - Sınıfa ait aktif "answer key image" varsa al
+   - Disk'e kaydet (uploads/exams/...)
+   - FastAPI'ye paperImage + answerKeyImage gönder
 
-### OCR katmanı
+4. FastAPI ExamService.process_exam():
+   a. answer_key_cache.get(SHA256(answerKeyImage)) → cache HIT mi?
+      └─ MISS: OCRService.extract(answerKeyImage)
+              → Qwen VLM çağrısı (~60-90 sn)
+              → Markdown çıkış: "*çoktan seçmeli soru / 1) ... (10p)"
+              → parse_s3_markdown() → list[AnswerKeyEntry]
+              → cache'e yaz
+      └─ HIT: cache'ten 1ms
+   b. OCRService.extract(paperImage) → öğrenci cevap listesi
+   c. NLPService.evaluate(student_ocr, answer_key):
+      Her soru için tip dispatch:
+      - MC  → MultipleChoiceScorer (letter exact)
+      - FB  → FillBlankScorer (exact + Türkçe normalize + token)
+      - OE  → OpenEndedScorer (SBERT semantic cosine similarity)
+   d. ExamProcessingResponse JSON döndür
 
-`app/services/ocr_service.py`
+5. Spring Boot:
+   - ExamResult entity'sine yaz (extracted_score, per-question detail)
+   - ExamSubmission entity'sine yaz (kâğıt görseli referansı)
+   - Android'e JSON dön
 
-- gerçek OCR çalıştırmaz
-- örnek iki soru ve iki cevap üretir
-- yüklenen dosya adı ve boyutundan placeholder çıktı oluşturur
-
-### NLP / değerlendirme katmanı
-
-`app/services/nlp_service.py`
-
-- OCR çıktısını alır
-- her soru için örnek `expectedAnswer`, `score` ve `feedback` üretir
-- toplam puanı hesaplar
-
-### Orkestrasyon katmanı
-
-`app/services/exam_service.py`
-
-- dosyayı okur
-- doğrulamaları yapar
-- OCR ve NLP servislerini doğru sırayla çağırır
-- hata oluşursa uygun uygulama hatasına çevirir
-
-### API katmanı
-
-`app/api/routes/exam.py`
-
-- dış dünyaya açılan endpointleri tanımlar
-- dependency injection ile servisleri bağlar
-- response modelini belirler
-
-Kısacası asıl merkez akış şudur:
-
-`UploadFile -> validation -> OCRService.extract() -> NLPService.evaluate() -> JSON response`
-
-## 5. Proje Yapısı
-
-```text
-app/
-├── api/
-│   ├── router.py                 # merkezi router
-│   └── routes/
-│       └── exam.py               # health ve process-exam endpointleri
-├── core/
-│   ├── config.py                 # uygulama ayarları
-│   └── exceptions.py             # özel exception ve handler'lar
-├── schemas/
-│   ├── __init__.py               # şema export'ları
-│   ├── common.py                 # ortak response modelleri
-│   └── exam.py                   # sınav işleme modelleri
-├── services/
-│   ├── exam_service.py           # orkestrasyon
-│   ├── nlp_service.py            # placeholder değerlendirme
-│   └── ocr_service.py            # placeholder OCR
-└── main.py                       # FastAPI app factory
-main.py                           # alternatif entrypoint
-requirements.txt
-README.md
+6. Android: Sonuç sayfasında skor + soru bazlı detay göster
 ```
 
-## 6. Teknik Özellikler ve Varsayılanlar
+### Performans
 
-Mevcut ayarlar `app/core/config.py` içinde tanımlıdır:
+| Faz | Süre (T4 GPU) |
+|---|---|
+| Spring Boot multipart receive | <100 ms |
+| FastAPI answer key OCR (cache MISS) | 60-90 sn |
+| FastAPI answer key OCR (cache HIT) | <1 ms |
+| FastAPI student paper OCR | 60-90 sn |
+| FastAPI NLP scoring (5 soru) | 1-3 sn |
+| Spring Boot persist + response | <500 ms |
+| **TOPLAM (cache MISS, ilk öğrenci)** | **~3-4 dakika** |
+| **TOPLAM (cache HIT, sonraki öğrenciler)** | **~1.5 dakika** |
 
-- uygulama adı: `OCR Exam Processing Service`
-- sürüm: `0.1.0`
-- maksimum dosya boyutu: `10 MB`
-- izin verilen içerik tipleri:
-  - `image/jpeg`
-  - `image/jpg`
-  - `image/png`
-  - `image/webp`
+Cache stratejisi sayesinde aynı sınıfın 30 öğrencisini puanlamak 30 × 1.5 dk ≈ **45 dakika** sürer.
 
-## 7. Endpointler
+---
 
-Bu projede route prefix tanımlı değildir; endpointler doğrudan root altında yayınlanır.
+## 4. OCR katmanı (FastAPI)
 
-### `GET /health`
+### Model seçimi: Qwen2.5-VL-7B-Instruct (4-bit quantize)
 
-Servisin ayakta olduğunu kontrol etmek için kullanılır.
+Tezde önce klasik OCR (EasyOCR, PaddleOCR) denendi:
+- ❌ Türkçe el yazısında düşük doğruluk
+- ❌ Layout heuristic'leri (Y-axis clustering) kırılgan
+- ❌ Sub-question, tablo, çoktan seçmeli karışık layout'larda çöküyor
 
-Örnek response:
+VLM (Vision-Language Model) çözümü:
+- ✅ Layout + OCR + structured extraction **tek geçişte**
+- ✅ Türkçe el yazısı + sembollerde (kimya formülleri vb.) belirgin iyileşme
+- ✅ Markdown formatında yapılandırılmış çıkış üretir
 
-```json
-{
-  "status": "ok"
-}
+**Quantization:** 4-bit `nf4` (bitsandbytes) — VRAM kullanımı ~6 GB, Colab T4 (16 GB) ve
+RTX 3060+ (8 GB+) ile uyumlu. Kalite kaybı minimal.
+
+**Deterministik mod:** `do_sample=False` — aynı görsel her seferinde aynı çıkışı verir
+(tez "reproducibility" iddiası).
+
+### OCR akışı
+
+```python
+# app/services/ocr_service.py
+class OCRService:
+    def extract(self, file_bytes: bytes, filename: str) -> OCRExtractionResult:
+        image = Image.open(io.BytesIO(file_bytes)).convert("RGB")
+        raw_text = self._loader.generate(image, OCR_PROMPT, max_new_tokens=768)
+        detected = parse_s3_markdown(raw_text)
+        return OCRExtractionResult(
+            raw_text=raw_text,
+            lines=raw_text.split("\n"),
+            detected_answers=detected,
+        )
 ```
 
-Kullanım amacı:
+### Prompt mühendisliği
 
-- Kubernetes / Docker health check
-- reverse proxy kontrolü
-- Spring tarafında servis ayakta mı diye hızlı doğrulama
+Tezde **deneme-yanılma** ile evrildi:
+- v1: ham OCR → degeneration (sonsuz tekrar) sorunu
+- v2: anti-degeneration parametreleri (`repetition_penalty`, `no_repeat_ngram_size`)
+- v3: tip etiketi `[open_ended]` yazdırma denemesi → VLM uyumsuzdu
+- v4 (mevcut): section başlığı + puan değerlerini **AYNEN koru** talimatı
+
+Mevcut prompt (özet):
+```
+KURALLAR:
+1. Yıldızlı (*) section başlıklarını AYNEN koru — '*çoktan seçmeli soru',
+   '*boşluk doldurma' gibi. Bu başlıklar skorlama tipini belirler.
+2. Soruların yanındaki puan değerlerini (10p), (5p) AYNEN yaz.
+3. Her soru için TEK BİR blok yaz.
+4. Çoktan seçmeli sorularda öğrencinin işaretlediği şıkkı tek harf olarak yaz.
+5. Sadece kâğıttaki cevapları yaz, kendi yorumlarını EKLEME.
+```
+
+### Markdown parser — `app/ml/ocr_parser.py`
+
+VLM çıkışı (örnek):
+```
+*çoktan seçmeli soru
+**1)** Türkiye'nin coğrafi konumu... (10p)
+A) ... B) ... C) ... D) ...
+
+*boşluk doldurma
+**1)** Dünya'nın en büyük... ülke? (5p)
+Cevap: Arjantin
+
+**1)** Fotosentez nedir? (10p)
+Cevap: ...
+```
+
+Parser bunu şuna dönüştürür:
+```python
+[
+    OCRDetectedAnswer(
+        question_number="mc1",          # mc/fb/oe prefix + numara
+        extracted_answer="...",
+        question_type=QuestionType.MULTIPLE_CHOICE,
+        max_score=10,                   # (10p) parse edildi
+    ),
+    OCRDetectedAnswer(question_number="fb1", question_type=FILL_BLANK, max_score=5, ...),
+    OCRDetectedAnswer(question_number="oe1", question_type=OPEN_ENDED, max_score=10, ...),
+]
+```
+
+**Compound ID (`mc1`, `fb1`, `oe1`)** sayesinde **tekrarlı numaralar** çakışmaz:
+çoktan seçmeli "1" ve boşluk doldurma "1" iki ayrı kayıt.
+
+**Section başlığı semantiği — one-shot:** Her `*section` başlığı sadece **kendinden sonraki bir
+soruyu** etiketler. Sonraki sorular için yeni başlık gerekir veya default OPEN_ENDED'a düşer.
+
+### Halüsinasyon ve gürültü filtreleri
+
+| Filtre | Ne yapar |
+|---|---|
+| `_filter_hallucinations` | `Yanlış cevap:`, `Not:`, `Çözüm:` gibi model yorumlarını ele |
+| `_is_empty_answer` | `(boş)` markörünü tanı, atla |
+| `_truncate_at_leak` | Bir block içine başka soru numarası sızdıysa kırp |
+| OCR typo varyantları | `seçmeli` ↔ `seçimli`, `boşluk` ↔ `boşluktan`, `uçlu` ↔ `uçlulu` |
+
+---
+
+## 5. NLP katmanı — tip bazlı skorlama
+
+### Strategy pattern (`app/scoring/`)
+
+```
+QuestionType.MULTIPLE_CHOICE → MultipleChoiceScorer  → letter exact match
+QuestionType.FILL_BLANK      → FillBlankScorer       → exact + TR normalize + token intersect
+QuestionType.OPEN_ENDED      → OpenEndedScorer       → SBERT cosine similarity
+```
+
+Dispatcher (`app/scoring/dispatcher.py`):
+```python
+def score_answer(*, question_type, expected, student, max_score, sbert_loader):
+    if question_type == QuestionType.MULTIPLE_CHOICE:
+        scorer = MultipleChoiceScorer()
+    elif question_type == QuestionType.FILL_BLANK:
+        scorer = FillBlankScorer()
+    else:  # OPEN_ENDED + UNKNOWN
+        scorer = OpenEndedScorer(sbert_loader=sbert_loader)
+
+    return scorer.score(expected=expected, student=student, max_score=max_score)
+```
+
+### `OpenEndedScorer` — SBERT semantic
+
+Fine-tuned SBERT modeli: `model_ai_noted_with_negatives_positives_v2/`
+(Türkçe domain-specific olarak `MultipleNegativesRankingLoss` ile eğitildi.)
+
+```python
+similarity = sbert_loader.similarity(expected, student)  # 0..1 cosine
+
+if similarity >= 0.85:                  → tam puan,      "Doğru."
+elif similarity >= 0.65:                → %60-80 puan,   "Kısmen doğru."
+elif similarity >= 0.40:                → %20-40 puan,   "Yakın ama yetersiz."
+else:                                   → 0 puan,        "Yanlış."
+```
+
+### `FillBlankScorer` — exact + TR normalize
+
+```python
+# Türkçe normalize: ı→i, ş→s, ç→c, ğ→g, ö→o, ü→u, lowercase, punctuation strip
+e_norm = _normalize(expected)   # "Fiziksel" → "fiziksel"
+s_norm = _normalize(student)    # "fızıksel" → "fiziksel" (OCR Türkçe karışıklığı)
+
+if e_norm == s_norm:                                   → tam puan
+elif (e_tokens & s_tokens):                            → %70 puan ("token kesişimi")
+else:                                                   → 0 puan
+```
+
+Eşleştirme cevapları (a→4, b→2) da bu scorer'a düşer — token kesişimi çiftleri sayar.
+
+### `MultipleChoiceScorer` — letter exact
+
+```python
+expected_letter = _extract_letter(expected)  # "C" → "C", "Cevap: C" → "C"
+student_letter = _extract_letter(student)
+
+if expected_letter == student_letter:        → tam puan
+else:                                         → 0 puan
+```
+
+---
+
+## 6. Standart sınav kâğıdı formatı
+
+Tezde tanımlanan format spesifikasyonu — öğretmenler sınav kâğıdı hazırlarken
+bu kurallara uymalı.
+
+### Section başlıkları
+
+| Başlık | Atadığı tip | Skorlama |
+|---|---|---|
+| `*çoktan seçmeli soru`, `*çoktan seçmeli`, `*multiple choice` | MULTIPLE_CHOICE | Letter exact |
+| `*boşluk doldurma`, `*eşleştirme`, `*fill in the blank`, `*matching` | FILL_BLANK | Exact + normalize |
+| `*açık uçlu`, `*klasik`, `*kısa cevaplı`, `*uzun cevaplı` (veya başlık YOK) | OPEN_ENDED | SBERT semantic |
+
+OCR yazım hataları toleranslı: `seçimli`, `boşluktan`, `uçlulu` da kabul edilir.
+
+### Puan değeri
+
+Format: `(Np)` — örnek: `(10p)`, `(5p)`, `(10 puan)`, `(15 pt)`.
+Soru başlığından sonra veya soru gövdesinde yer alabilir.
+
+### Numaralandırma
+
+Her section kendi içinde `1)`, `2)`... yazabilir. Parser otomatik olarak
+section prefix ekler (`mc1`, `mc2`, `fb1`, `oe1`...).
+
+### Örnek kâğıt (sadeleştirilmiş)
+
+```
+Okul Adı
+2.dönem 1.yazılı
+
+Ad: ___ Soyad: ___ Sınıf: ___
+
+*çoktan seçmeli soru
+1) Türkiye'nin coğrafi konumu? (10p)
+A) Devşirme Sistemi
+B) İskân Politikası
+C) Tımar Sistemi
+D) İltizam Sistemi
+
+*çoktan seçmeli soru
+2) ... (10p)
+A) ... B) ... C) ... D) ...
+
+*boşluk doldurma
+1) Dünya'nın en büyük yüzölçümüne sahip ülke ........'dir. (5p)
+
+*açık uçlu
+1-) Fotosentez nedir ve önemi nedir? (10p)
+Cevap: _________
+
+*açık uçlu
+2-) ... (10p)
+Cevap: _________
+```
+
+---
+
+## 7. API sözleşmesi
 
 ### `POST /process-exam`
 
-Sınav görselini işleyen ana endpoint budur.
+**Content-Type:** `multipart/form-data`
 
-#### İstek formatı
+| Field | Tip | Zorunlu | Açıklama |
+|---|---|---|---|
+| `paperImage` | UploadFile | ✅ | Öğrencinin doldurduğu sınav kâğıdı (JPEG/PNG/WEBP, max 10 MB) |
+| `answerKeyImage` | UploadFile | ⚠️ | Öğretmenin doğru cevap kâğıdı. Verilmezse NLP skor hesaplanmaz, sadece OCR çıkışı döndürülür. |
 
-- Method: `POST`
-- Content-Type: `multipart/form-data`
-- Form alanı adı: `image`
-
-#### Beklenen dosya tipleri
-
-- `image/jpeg`
-- `image/jpg`
-- `image/png`
-- `image/webp`
-
-#### Başarılı response
-
+**Response — 200:**
 ```json
 {
+  "score": 35,
   "questions": [
     {
-      "questionId": "1",
-      "questionText": "Question 1",
-      "extractedAnswer": "Student answer extracted from the uploaded image.",
-      "expectedAnswer": "Expected answer for Question 1",
+      "questionId": "mc1",
+      "questionText": "",
+      "extractedAnswer": "B",
+      "expectedAnswer": "B",
       "score": 10,
-      "feedback": "Placeholder evaluation completed successfully."
+      "feedback": "[multiple_choice] Doğru (B)."
     },
     {
-      "questionId": "2",
-      "questionText": "Question 2",
-      "extractedAnswer": "Another placeholder answer extracted for demo purposes.",
-      "expectedAnswer": "Expected answer for Question 2",
-      "score": 10,
-      "feedback": "Placeholder evaluation completed successfully."
+      "questionId": "fb1",
+      "extractedAnswer": "Arjantin",
+      "expectedAnswer": "Arjantin",
+      "score": 5,
+      "feedback": "[fill_blank] Doğru."
+    },
+    {
+      "questionId": "oe1",
+      "extractedAnswer": "Fotosentez bitkilerin...",
+      "expectedAnswer": "Fotosentez bitkilerin ışık enerjisini...",
+      "score": 8,
+      "feedback": "[open_ended] Kısmen doğru, eksik kavramlar var. (benzerlik: 0.78)"
     }
-  ],
-  "score": 20
+  ]
 }
 ```
 
-#### Response alanlarının anlamı
+**Error responses:**
 
-| Alan | Tip | Açıklama |
-| --- | --- | --- |
-| `questions` | `array` | Her soru için üretilen değerlendirme çıktısı |
-| `questions[].questionId` | `string` | Sorunun kimliği veya numarası |
-| `questions[].questionText` | `string` | OCR/NLP akışındaki soru metni |
-| `questions[].extractedAnswer` | `string` | Görselden çıkarılan öğrenci cevabı |
-| `questions[].expectedAnswer` | `string` | Beklenen cevap |
-| `questions[].score` | `int` | Sorunun puanı |
-| `questions[].feedback` | `string` | Soru bazlı kısa geri bildirim |
-| `score` | `int` | Toplam puan |
+| Status | Sebep |
+|---|---|
+| 400 | Dosya eksik / boş / okuma hatası |
+| 413 | Dosya boyutu 10 MB'ı aştı |
+| 415 | Desteklenmeyen MIME (sadece image/jpeg, image/png, image/webp) |
+| 502 | OCR veya NLP iç hatası (Qwen yüklenmedi, vb.) |
+| 500 | Beklenmeyen |
 
-## 8. Hata Yönetimi
-
-Servis hata durumlarında okunabilir JSON döner:
+### `GET /health`
 
 ```json
-{
-  "detail": "Hata açıklaması",
-  "error": "makine_okunur_hata_kodu"
-}
+{ "status": "ok" }
 ```
 
-### Sık karşılaşılacak hata senaryoları
+### `GET /docs`
 
-#### 1. Dosya gönderilmedi
+Otomatik üretilen Swagger UI.
 
-HTTP `400`
+---
 
-```json
-{
-  "detail": "Image file is required.",
-  "error": "missing_file"
-}
+## 8. Kullanılan teknolojiler
+
+### AI / ML
+- **PyTorch 2.7+** (CUDA 11.8) — tensor operasyonları
+- **transformers 5.0+** — HuggingFace model API'si
+- **bitsandbytes** — 4-bit `nf4` quantization
+- **Qwen2.5-VL-7B-Instruct** — Vision-Language Model (Alibaba)
+- **sentence-transformers** — SBERT wrapper
+- **Fine-tuned SBERT** — Türkçe domain (`MultipleNegativesRankingLoss`)
+- **accelerate** — büyük model yükleme
+
+### Backend
+- **FastAPI 0.136+** — async REST API
+- **uvicorn** — ASGI server
+- **Pydantic 2** — schema validation
+- **Pillow 11** — image I/O
+
+### Deployment
+- **Google Colab T4/L4 GPU** — runtime
+- **pyngrok** — public URL tunneling
+- **Google Drive** — model cache (449 MB SBERT + ~6 GB Qwen)
+- **Git + GitHub** — versiyon kontrolü
+
+### Test
+- **pytest** — 44 unit test (parser + scoring + NLP)
+- Mock SBERT (CPU-free testler)
+
+---
+
+## 9. Proje yapısı
+
+```
+tez_fastAPI/
+├── app/
+│   ├── main.py                          # FastAPI app factory + lifespan event
+│   ├── api/
+│   │   ├── router.py
+│   │   └── routes/
+│   │       └── exam.py                  # POST /process-exam, GET /health
+│   ├── core/
+│   │   ├── config.py                    # Settings (max_upload_size, allowed_mime)
+│   │   └── exceptions.py                # Custom exceptions + handlers
+│   ├── ml/                              # ← AI yükleyiciler + parser
+│   │   ├── qwen_loader.py               # Qwen2.5-VL singleton, 4-bit load
+│   │   ├── sbert_loader.py              # SBERT singleton
+│   │   ├── ocr_parser.py                # Markdown → OCRDetectedAnswer
+│   │   └── answer_key_cache.py          # SHA256 hash bazlı cache
+│   ├── scoring/                         # ← Strategy pattern
+│   │   ├── base.py                      # Scorer ABC + ScoreResult
+│   │   ├── open_ended.py                # SBERT semantic
+│   │   ├── fill_blank.py                # Exact + TR normalize
+│   │   ├── multiple_choice.py           # Letter exact
+│   │   └── dispatcher.py                # Tip → scorer route
+│   ├── schemas/
+│   │   ├── common.py                    # ErrorResponse, HealthResponse
+│   │   └── exam.py                      # OCRDetectedAnswer, ExamProcessingResponse, ...
+│   └── services/
+│       ├── exam_service.py              # Orkestrasyon + dosya validation + cache
+│       ├── ocr_service.py               # Qwen + prompt + parser glue
+│       └── nlp_service.py               # answer_key dict + dispatch
+├── model_ai_noted_with_negatives_positives_v2/  # Fine-tuned SBERT (gitignored)
+├── notebooks/
+│   ├── colab_fastapi_runner.ipynb       # Colab uvicorn + ngrok
+│   └── colab_qwen_ocr_spike.ipynb       # Eski spike notebook
+├── scripts/
+│   ├── setup_ocr.ps1                    # Lokal Windows kurulum
+│   └── spike_qwen_vl.py                 # OCR spike CLI script
+├── tests/
+│   ├── test_ocr_parser.py               # Parser + section detection
+│   ├── test_nlp_service.py              # NLPService dispatch
+│   └── test_scoring.py                  # 4 scorer + dispatcher
+├── requirements.txt
+├── main.py                              # uvicorn entrypoint
+└── README.md                            # bu dosya
 ```
 
-#### 2. Dosya boş
+---
 
-HTTP `400`
+## 10. Lokal geliştirme
 
-```json
-{
-  "detail": "Uploaded image is empty.",
-  "error": "empty_file"
-}
-```
+### Sistem gereksinimleri
 
-#### 3. Dosya tipi desteklenmiyor
+| Bileşen | Önerilen |
+|---|---|
+| Python | 3.13 |
+| GPU | NVIDIA 8+ GB VRAM (4 GB'ta sıkışık) |
+| CUDA | 11.8 |
+| Disk | 10 GB boş (model cache) |
+| RAM | 16 GB+ |
 
-HTTP `415`
+### Kurulum
 
-```json
-{
-  "detail": "Unsupported file type. Allowed types: image/jpeg, image/jpg, image/png, image/webp.",
-  "error": "unsupported_file_type"
-}
-```
+```powershell
+# Venv
+python -m venv .venv
+.venv\Scripts\activate
 
-#### 4. Dosya boyutu çok büyük
+# PyTorch CUDA build (CPU-only çalışmaz)
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118
 
-HTTP `413`
-
-```json
-{
-  "detail": "Uploaded image exceeds the maximum allowed size.",
-  "error": "file_too_large"
-}
-```
-
-#### 5. OCR katmanı hata verdi
-
-HTTP `502`
-
-```json
-{
-  "detail": "OCR processing failed.",
-  "error": "ocr_processing_failed"
-}
-```
-
-#### 6. NLP / değerlendirme katmanı hata verdi
-
-HTTP `502`
-
-```json
-{
-  "detail": "NLP processing failed.",
-  "error": "nlp_processing_failed"
-}
-```
-
-#### 7. Beklenmeyen sunucu hatası
-
-HTTP `500`
-
-```json
-{
-  "detail": "Internal processing error.",
-  "error": "internal_error"
-}
-```
-
-## 9. Spring Boot Tarafı Bu Servisi Nasıl Kullanmalı?
-
-Bu proje mimari olarak **Spring'in arkasında çalışan uzman servis** olarak tasarlanmıştır. Yani ideal kullanımda frontend doğrudan FastAPI'ye değil, Spring Boot'a istek atar.
-
-### Önerilen entegrasyon yaklaşımı
-
-1. Frontend, kullanıcıdan sınav görselini alır.
-2. Frontend bu görseli Spring Boot'taki örneğin `/api/exams/process` benzeri bir endpoint'e yollar.
-3. Spring Boot kullanıcı doğrulaması, sınav/öğrenci doğrulaması ve iş kurallarını uygular.
-4. Spring Boot görseli FastAPI'deki `POST /process-exam` endpoint'ine iletir.
-5. FastAPI sonucu JSON olarak döner.
-6. Spring Boot isterse:
-   - sonucu veritabanına kaydeder,
-   - ek domain alanları ekler,
-   - sonucu frontend için farklı bir response modeline map eder.
-
-### Spring neden arada olmalı?
-
-Çünkü genellikle şu sorumluluklar Spring'de bulunur:
-
-- authentication / authorization
-- kullanıcı, öğretmen, öğrenci, sınav yönetimi
-- sonuç geçmişi ve raporlama
-- veritabanına kayıt
-- dosya saklama politikaları
-- audit log ve transaction yönetimi
-
-FastAPI bu yapıda sadece "işleme motoru" olur.
-
-### Spring tarafında request nasıl atılmalı?
-
-FastAPI şu kontratı bekler:
-
-- URL: `POST /process-exam`
-- Body: `multipart/form-data`
-- Alan adı: `image`
-
-### Spring için örnek DTO karşılığı
-
-```java
-public class ExamProcessingResponse {
-    private List<QuestionItem> questions;
-    private int score;
-}
-
-public class QuestionItem {
-    private String questionId;
-    private String questionText;
-    private String extractedAnswer;
-    private String expectedAnswer;
-    private int score;
-    private String feedback;
-}
-```
-
-### Spring WebClient ile örnek çağrı
-
-```java
-MultipartBodyBuilder builder = new MultipartBodyBuilder();
-builder.part("image", imageResource)
-       .filename("exam.jpg")
-       .contentType(MediaType.IMAGE_JPEG);
-
-ExamProcessingResponse response = webClient.post()
-    .uri("http://fastapi-service:8000/process-exam")
-    .contentType(MediaType.MULTIPART_FORM_DATA)
-    .body(BodyInserters.fromMultipartData(builder.build()))
-    .retrieve()
-    .bodyToMono(ExamProcessingResponse.class)
-    .block();
-```
-
-### Spring tarafında önerilen servis akışı
-
-```text
-Controller
-  -> Application Service
-     -> FastApiClient
-        -> FastAPI /process-exam
-     -> ResultMapper / Persistence
-  -> Frontend response
-```
-
-### Spring tarafında yapılması iyi olur
-
-- FastAPI timeout yönetimi eklemek
-- `502`, `500`, `415`, `413` gibi hataları düzgün map etmek
-- FastAPI sonucu veritabanına kaydetmek
-- tekrar deneme, circuit breaker veya fallback kurgulamak
-- log ve correlation id geçirmek
-
-## 10. Frontend Tarafı Bu Yapıda Nasıl Çalışmalı?
-
-Frontend'in en sağlıklı yaklaşımı, FastAPI ile doğrudan konuşmak yerine Spring Boot ile konuşmasıdır.
-
-### Önerilen frontend akışı
-
-1. Kullanıcı dosya seçer.
-2. Frontend `FormData` oluşturur.
-3. İstek Spring endpoint'ine gönderilir.
-4. Spring FastAPI'yi çağırır.
-5. Spring nihai sonucu frontend'e döner.
-6. Frontend soru bazlı puanları ve toplam puanı gösterir.
-
-### Neden frontend doğrudan FastAPI'ye gitmemeli?
-
-- auth ve token doğrulama çoğunlukla Spring'dedir
-- CORS yönetimini sade tutar
-- business logic tek yerde toplanır
-- FastAPI iç servis olarak kalır
-- servis değişse bile frontend kontratı daha stabil olur
-
-### Frontend'de örnek istek mantığı
-
-```javascript
-const formData = new FormData();
-formData.append("image", file);
-
-const response = await fetch("/api/exams/process", {
-  method: "POST",
-  body: formData,
-});
-
-const data = await response.json();
-```
-
-Burada dikkat edilmesi gereken nokta şudur: frontend örnekte **Spring endpoint'ine** istek atar. Spring ise arka planda FastAPI'yi çağırır.
-
-### Frontend'in gösterebileceği örnek ekran alanları
-
-- toplam puan
-- soru listesi
-- her sorunun çıkarılan cevabı
-- beklenen cevap
-- öğretmen geri bildirimi / model feedback
-- işleme hatası varsa kullanıcı dostu hata mesajı
-
-## 11. Uçtan Uca Akış Senaryosu
-
-Örnek senaryo:
-
-1. Öğrenci ya da öğretmen bir sınav görseli yükler.
-2. Frontend dosyayı Spring'e yollar.
-3. Spring dosyanın ilgili kullanıcıya/sınava ait olup olmadığını kontrol eder.
-4. Spring dosyayı FastAPI'ye aktarır.
-5. FastAPI dosya tipini ve boyutunu doğrular.
-6. OCR placeholder çıktısı üretilir.
-7. NLP placeholder değerlendirmesi yapılır.
-8. Toplam puan hesaplanır.
-9. Sonuç Spring'e döner.
-10. Spring sonucu ister saklar ister doğrudan istemciye döner.
-
-## 12. Gerçek OCR / NLP Entegrasyonu Geldiğinde Neler Değişecek?
-
-En önemli avantaj, API katmanını bozmadan iç servisi değiştirebilmenizdir.
-
-Değiştirilecek yerler:
-
-- `app/services/ocr_service.py`
-- `app/services/nlp_service.py`
-
-Muhtemel geliştirmeler:
-
-- Tesseract, PaddleOCR, EasyOCR veya bulut OCR servisleri
-- LLM tabanlı cevap değerlendirme
-- soru anahtarına göre dinamik puanlama
-- rubric bazlı değerlendirme
-- çok sayfalı PDF/görsel desteği
-- el yazısı tanıma
-
-Bu geliştirmeler yapılırken mümkün olduğunca şu dosyaları sabit tutmak avantaj sağlar:
-
-- `app/api/routes/exam.py`
-- `app/schemas/exam.py`
-
-Böylece Spring entegrasyonu kırılmaz.
-
-## 13. Lokal Kurulum
-
-### Gereksinimler
-
-- Python 3.11+ önerilir
-- `pip`
-
-### Paket kurulumu
-
-```bash
+# Diğer
 pip install -r requirements.txt
+
+# SBERT modelini temin et (449 MB, git'te yok)
+# Google Drive'dan kopyala veya HuggingFace push'tan çek
+# Hedef yol: model_ai_noted_with_negatives_positives_v2/
 ```
 
-### Uygulamayı çalıştırma
+### Çalıştırma
 
-```bash
+```powershell
 uvicorn app.main:app --reload
 ```
 
-Alternatif entrypoint:
-
-```bash
-uvicorn main:app --reload
+Hızlı kontrol:
+```powershell
+curl http://localhost:8000/health
+# {"status":"ok"}
 ```
 
-Uygulama varsayılan olarak şu adreste çalışır:
+Swagger UI: http://localhost:8000/docs
 
-- `http://127.0.0.1:8000`
-
-## 14. API Dokümantasyonu
-
-FastAPI varsayılan dokümantasyon ekranları kullanılabilir:
-
-- Swagger UI: `http://127.0.0.1:8000/docs`
-- ReDoc: `http://127.0.0.1:8000/redoc`
-
-Spring ekibi veya frontend ekibi, entegrasyon sırasında bu sayfalar üzerinden endpoint sözleşmesini hızlıca test edebilir.
-
-## 15. Örnek İstekler
-
-### `curl` ile
-
-```bash
-curl -X POST "http://127.0.0.1:8000/process-exam" \
-  -H "accept: application/json" \
-  -F "image=@sample_exam.jpg;type=image/jpeg"
-```
-
-### PowerShell ile
+### Test
 
 ```powershell
-$form = @{
-  image = Get-Item ".\sample_exam.jpg"
-}
-
-Invoke-RestMethod `
-  -Uri "http://127.0.0.1:8000/process-exam" `
-  -Method Post `
-  -Form $form
+pytest tests/ -v
 ```
 
-### Health check
+44 test geçmeli. GPU gerek yok (SBERT mock'lanır).
 
-```bash
-curl http://127.0.0.1:8000/health
+---
+
+## 11. Production / demo deployment (Colab + ngrok)
+
+Sistem **demo amaçlı** Colab GPU + ngrok tunnel ile dışarıya açılır.
+Self-hosted GPU server alternatifi tezdeki "future work" kapsamında.
+
+### Setup (tek seferlik)
+
+1. **Google Drive'a iki şey yükle:**
+   - `tez_kaynaklari/model_ai_noted_with_negatives_positives_v2/` (SBERT, 449 MB)
+   - (İlk Colab çalıştırmasından sonra) `tez_kaynaklari/qwen_cache/` (~6 GB)
+
+2. **ngrok hesap aç:** https://dashboard.ngrok.com/get-started/your-authtoken
+   Bedava tier yeterli (session başında URL değişir).
+
+### Her demo başında
+
+1. Colab'da notebook'u aç:
+   https://colab.research.google.com/github/nebiavsar/tez_fastAPI/blob/main/notebooks/colab_fastapi_runner.ipynb
+2. **Çalışma zamanı → T4 GPU**
+3. **Çalışma zamanı → Tümünü çalıştır**
+4. Drive izni → onayla
+5. ngrok token → yapıştır
+6. Bölüm 6 çıktısından `FASTAPI_BASE_URL=...` satırını kopyala
+
+Süre: ilk çalıştırma ~10 dk (Qwen + SBERT yükleme), sonraki çalıştırmalar Drive
+cache sayesinde ~2 dk.
+
+### Cleanup
+
+Notebook Bölüm 10 hücresi tunnel + uvicorn'u durdurur.
+
+---
+
+## 12. Spring Boot entegrasyonu
+
+`tez_springBootAPI` lokal makinede çalışır, FastAPI URL'sini env var ile alır.
+
+### Spring Boot setup
+
+**`application.properties`** (env var fallback ile):
+```properties
+app.fastapi.base-url=${FASTAPI_BASE_URL:http://localhost:8000}
+spring.servlet.multipart.max-request-size=25MB
 ```
 
-## 16. Geliştirme Notları
+**`WebClientConfig.java`** — 5 dakika read timeout (OCR + NLP toplam ~3-4 dk):
+```java
+HttpClient httpClient = HttpClient.create()
+    .option(ChannelOption.CONNECT_TIMEOUT_MILLIS, 30_000)
+    .responseTimeout(Duration.ofMinutes(5))
+    .doOnConnected(c -> c.addHandlerLast(new ReadTimeoutHandler(300, SECONDS)));
+```
 
-- Logging yapılandırması `app/main.py` içinde yapılır.
-- Özel exception handler'lar `app/core/exceptions.py` içinde toplanmıştır.
-- Response modelleri Pydantic ile tanımlanmıştır.
-- Route katmanı ile servis katmanı birbirinden ayrıldığı için kod kolay genişletilebilir.
+### Demo akışı
 
-## 17. Kısa Sonuç
+```powershell
+# 1. Colab'dan ngrok URL'i kopyaladıktan sonra IntelliJ Run Config:
+#    Environment variables → FASTAPI_BASE_URL=https://abcd-1234.ngrok-free.app
 
-Bu repo, sınav görsellerini işlemek için tasarlanmış, Spring Boot ile entegre çalışan bir FastAPI servisidir. Şu anda placeholder mantıkla çalışır; ancak endpoint yapısı, hata sözleşmesi ve response modeli gerçek üretim entegrasyonuna uygun olacak şekilde kurgulanmıştır.
+# 2. Windows Firewall (ilk seferlik, port 8080 telefondan erişim için):
+New-NetFirewallRule -DisplayName "Spring Boot 8080" -Direction Inbound `
+  -LocalPort 8080 -Protocol TCP -Action Allow
 
-En önemli fikir şudur:
+# 3. PC'nin lokal IP'sini öğren (telefon bu IP'ye konuşur):
+ipconfig | findstr "IPv4"
+# Örnek: 192.168.1.42
 
-- **Frontend -> Spring Boot -> FastAPI** ana akış olmalı
-- FastAPI işleme motoru gibi davranmalı
-- Spring ana sistem olarak kalmalı
-- Gerçek OCR/NLP eklendiğinde dış API kontratı bozulmamalı
+# 4. IntelliJ'de Run → Spring Boot ayağa kalkar
+```
+
+### Android (Kotlin)
+
+```kotlin
+private const val API_BASE = "http://192.168.1.42:8080/api"   // PC'nin lokal IP'si
+// ❌ localhost olmaz, telefonda kendi IP'sine bakar
+// Telefon ve PC aynı wifi'de olmalı
+```
+
+---
+
+## 13. Test sonuçları
+
+### Vaka 1 — ornek3.jpeg (lise kimya sınavı, el yazısı)
+
+| Soru | Tip | Skor | Detay |
+|---|---|---|---|
+| 1 | open_ended | 10/10 | Kimya denklemi, SBERT benzerlik 0.96 |
+| 2 | open_ended | 7/10 | Fill-in-the-blank içerik, OCR el yazısı zorlandı |
+| 3 | open_ended | 10/10 | SBERT benzerlik 0.85 |
+| 4 | open_ended | 10/10 | SBERT benzerlik 1.00 |
+| 5 | open_ended | 10/10 | SBERT benzerlik 0.91 |
+| **TOPLAM** | | **47/50 (%94)** | |
+
+### Vaka 2 — Ahmet Yesevi Ortaokulu (karışık tip sınav)
+
+Section başlıkları + farklı tipler birarada.
+
+| Soru | Tip | Scorer | Skor |
+|---|---|---|---|
+| mc1 | multiple_choice | MultipleChoiceScorer | 10/10 |
+| fb1 | fill_blank | FillBlankScorer | 10/10 |
+| oe1 | open_ended | OpenEndedScorer (SBERT) | 10/10 |
+| oe2 | open_ended | OpenEndedScorer | 10/10 |
+| oe3 | open_ended | OpenEndedScorer | 10/10 |
+| **TOPLAM** | | | **50/50** |
+
+(mc2 ve fb2 OCR atladı — VLM tekrarlı section başlıklarını birleştirdi. Bilinen sınır.)
+
+### Unit tests
+
+```
+44 passed in 0.41s
+  - tests/test_ocr_parser.py: 20 test (section detection, compound IDs, sub-question grouping)
+  - tests/test_nlp_service.py: 7 test (dispatch + answer_key mapping)
+  - tests/test_scoring.py: 17 test (4 scorer + dispatcher)
+```
+
+---
+
+## 14. Sınırlamalar ve gelecek çalışmalar
+
+### Bilinen sınırlamalar
+
+1. **VLM tekrarlı section başlıklarını birleştirebilir** — `*çoktan seçmeli` iki kez
+   ardışık yazılırsa, VLM bazen bir tanesini OCR çıkışına almaz. Sonraki soru
+   default OPEN_ENDED'a düşer.
+
+2. **MC işaretli şık tespiti zayıf** — Öğrenci A/B/C/D yazarsa OK, ama sadece
+   yuvarlağa alıp/karaladıysa Qwen bazen okuyamaz. Future: OpenCV ile koyu pixel
+   yoğunluğu karşılaştırması.
+
+3. **Qwen2.5-VL Türkçe el yazısında "orta" kalite** — bazı kelimelerde typo
+   yapar ("seçmeli" → "seçimli"). Parser bu varyantları kabul ediyor ama
+   kalitesi kullanıcı yazısının zorluğuna bağlı.
+
+4. **Demo deployment kırılgan** — Colab session 12 saatte timeout, ngrok URL
+   değişir. Production için self-hosted GPU server veya ngrok Pro gerek.
+
+5. **SBERT skorlama eşikleri tahmini** — `0.85 / 0.65 / 0.40` thresholds
+   experimental olarak ayarlandı, geniş bir validation set üzerinde
+   optimize edilmedi.
+
+### Future work
+
+- **OpenCV bazlı MC işaretleme tespiti**
+- **Daha büyük VLM** (Qwen2.5-VL-32B veya 72B, A100 GPU üzerinde)
+- **Soru tipine göre fine-tuned SBERT** (matematik için sembol-aware vs.)
+- **Self-hosted production deployment** (Hetzner GPU + Docker)
+- **Web frontend** (mevcut Android'in yanına)
+- **Validation set ile eşik optimizasyonu**
+
+---
+
+## Lisans
+
+Akademik kullanım — lisans tezi kapsamında. Detay için yazara başvur.
+
+## İletişim
+
+**Yazar:** Nebi Avsar
+**GitHub:** [@nebiavsar](https://github.com/nebiavsar)
+**Repo:** [tez_fastAPI](https://github.com/nebiavsar/tez_fastAPI)
